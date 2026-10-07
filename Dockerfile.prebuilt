@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1
+#
+# CI / Release용: 이미 빌드된 Linux 바이너리만 넣는 런타임 이미지 (멀티스테이지 없음).
+# 로컬 docker compose는 루트 Dockerfile(한국어 UI 멀티스테이지)을 사용합니다.
+#
+#   dist/<TARGETARCH>/artex 를 준비한 뒤:
+#   docker build -f Dockerfile.prebuilt -t artex:local .
+FROM python:3.12-slim-bookworm
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates ripgrep curl wget vim git jq unzip \
+      dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+RUN npm install -g @playwright/mcp@latest @playwright/cli@latest playwright@latest \
+    && playwright-cli --help \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY dist/${TARGETARCH}/artex /app/artex
+COPY start.sh /app/start.sh
+RUN chmod +x /app/artex /app/start.sh
+COPY skills/ /app/skills/
+VOLUME ["/app/data"]
+EXPOSE 8787 8788
+ENTRYPOINT ["/app/start.sh"]
+CMD ["-addr", ":8787", "-proxy", ":8788"]

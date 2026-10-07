@@ -1,0 +1,3416 @@
+"use client";
+
+import * as React from "react";
+
+import Link from "next/link";
+
+import {
+ DndContext,
+ type DragEndEvent,
+ DragOverlay,
+ type DragStartEvent,
+ KeyboardSensor,
+ PointerSensor,
+ useDraggable,
+ useDroppable,
+ useSensor,
+ useSensors,
+} from "@dnd-kit/core";
+import {
+ ArchiveIcon,
+ ArrowDownIcon,
+ ArrowUpDownIcon,
+ ArrowUpIcon,
+ ChevronRightIcon,
+ EyeIcon,
+ FolderInputIcon,
+ GripVerticalIcon,
+ Loader2Icon,
+ PaperclipIcon,
+ PauseIcon,
+ PencilIcon,
+ PinIcon,
+ PinOffIcon,
+ PlayIcon,
+ PlusIcon,
+ SaveIcon,
+ SearchIcon,
+ SlidersHorizontalIcon,
+ StarIcon,
+ TagsIcon,
+ Trash2Icon,
+ Undo2Icon,
+ XIcon,
+} from "lucide-react";
+import { toast } from "sonner";
+
+import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
+import { StatusBadge } from "@/components/status-badge";
+import { TablePagination } from "@/components/table-pagination";
+import { TaskLLMProfileChain } from "@/components/task-llm-profile-chain";
+import { TaskTemplateControls } from "@/components/task-template-controls";
+import {
+ AlertDialog,
+ AlertDialogAction,
+ AlertDialogCancel,
+ AlertDialogContent,
+ AlertDialogDescription,
+ AlertDialogFooter,
+ AlertDialogHeader,
+ AlertDialogTitle,
+ AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+ Combobox,
+ ComboboxChip,
+ ComboboxChips,
+ ComboboxChipsInput,
+ ComboboxContent,
+ ComboboxEmpty,
+ ComboboxItem,
+ ComboboxList,
+ ComboboxValue,
+} from "@/components/ui/combobox";
+import {
+ Dialog,
+ DialogClose,
+ DialogContent,
+ DialogDescription,
+ DialogFooter,
+ DialogHeader,
+ DialogTitle,
+ DialogTrigger,
+} from "@/components/ui/dialog";
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
+import {
+ Field,
+ FieldContent,
+ FieldDescription,
+ FieldGroup,
+ FieldLabel,
+ FieldLegend,
+ FieldSet,
+} from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
+import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+ Sheet,
+ SheetClose,
+ SheetContent,
+ SheetDescription,
+ SheetFooter,
+ SheetHeader,
+ SheetTitle,
+ SheetTrigger,
+} from "@/components/ui/sheet";
+import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { api } from "@/lib/api";
+import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
+import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
+import type {
+ AssetInterceptRuleInput,
+ ChatAttachment,
+ Company,
+ DeleteTaskOptions,
+ DeleteTaskResult,
+ LLMProfile,
+ Task,
+ TaskArchive,
+ TaskArchiveState,
+ TaskCategory,
+ TaskStatus,
+} from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+// fmtBytes renders a human file size for the upload manifest.
+function fmtBytes(n: number): string {
+ if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(1)} MB`;
+ if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(1)} KB`;
+ return `${n} B`;
+}
+
+// UPLOAD_MARKER labels the auto-appended block of uploaded-file paths inside the task
+// description, so re-uploads append under the same block instead of adding a new header.
+const UPLOAD_MARKER = "【파일 업로드(절대 경로)】";
+
+// appendUploads folds newly-uploaded files' ABSOLUTE paths into the description as a
+// Read/Bash-friendly manifest — the worker opens them by path. Keeps one marked block:
+// first upload adds the header, later uploads append bullets under it.
+function appendUploads(desc: string, atts: ChatAttachment[]): string {
+ const bullets = atts.map((a) => `- ${a.abs ?? a.path}（${fmtBytes(a.size)}）`).join("\n");
+ if (desc.includes(UPLOAD_MARKER)) {
+ return `${desc.replace(/\s*$/, "")}\n${bullets}\n`;
+ }
+ const head = desc.trim() ? `${desc.replace(/\s*$/, "")}\n\n` : "";
+ return `${head}${UPLOAD_MARKER} worker가 Read/Bash로 경로를 열 수 있습니다:\n${bullets}\n`;
+}
+
+// POLL_MS is the task-list refresh interval. Task state moves on the server (planner /
+// worker), so the list has to be pulled; 10s is plenty for status / 도 / token .
+const POLL_MS = 10_000;
+const MAX_SOURCE_TASKS = 8;
+
+// fmtTokens renders a compact token count (1234 → 1.2k, 2_000_000 → 2M).
+function fmtTokens(n: number): string {
+ if (n >= 1_000_000) return (n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1) + "M";
+ if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k";
+ return String(n);
+}
+
+// fmtDuration renders a run duration in seconds as a compact human string.
+function fmtDuration(sec: number): string {
+ if (sec <= 0) return "—";
+ const d = Math.floor(sec / 86400);
+ const h = Math.floor((sec % 86400) / 3600);
+ const m = Math.floor((sec % 3600) / 60);
+ const s = sec % 60;
+ if (d > 0) return `${d}d ${h}h`;
+ if (h > 0) return `${h}h ${m}m`;
+ if (m > 0) return `${m}m ${s}s`;
+ return `${s}s`;
+}
+
+// taskDuration is the task's run duration in seconds: created → now while running,
+// created → completion for a finished task, else created → last activity. 0 when it
+// never ran (no activity yet).
+function taskDuration(task: Task, nowSec: number): number {
+ const start = task.created_unix ?? 0;
+ if (!start) return 0;
+ const end =
+ task.status === "running"
+ ? nowSec
+ : task.completed_unix && task.completed_unix > 0
+ ? task.completed_unix
+ : (task.last_activity_unix ?? 0);
+ return end > start ? end - start : 0;
+}
+
+// deleteDetails takes only the countable part of the result so callers can pass an
+// aggregate accumulated over a bulk delete.
+type DeleteCounts = Omit<DeleteTaskResult, "deleted" | "cleanup_warning">;
+
+function deleteDetails(result: DeleteCounts): string[] {
+ const details: string[] = [];
+ if (result.assets_deleted > 0) details.push(`삭제된 자산 ${result.assets_deleted} 건`);
+ if (result.assets_detached > 0) details.push(`공유 자산 연결 해제 ${result.assets_detached} 건`);
+ if (result.traffic_deleted > 0) details.push(`삭제트래픽 ${result.traffic_deleted} 건`);
+ if (result.files_deleted) details.push("작업 파일 삭제");
+ if (result.findings_deleted > 0) details.push(`삭제된 취약점 ${result.findings_deleted} 건`);
+ if (result.llm_records_deleted > 0) details.push(`삭제된 LLM 요청/응답 기록 ${result.llm_records_deleted} 건`);
+ return details;
+}
+
+function deleteSummary(result: DeleteTaskResult): string {
+ const details = deleteDetails(result);
+ return details.length > 0 ? `작업이 삭제되었습니다（${details.join("，")}）` : "작업이 삭제되었습니다";
+}
+
+// fmtDateTime renders a unix-seconds timestamp as a compact local date-time
+// (MM-DD HH:mm), or "—" when unset.
+function fmtDateTime(unix?: number): string {
+ if (!unix || unix <= 0) return "—";
+ const d = new Date(unix * 1000);
+ const p = (n: number) => String(n).padStart(2, "0");
+ return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
+ { value: "created", label: "생성됨" },
+ { value: "queued", label: "대기열" },
+ { value: "running", label: "실행 중" },
+ { value: "paused", label: "일시정지" },
+ { value: "done", label: "완료" },
+ { value: "failed", label: "실패" },
+ { value: "timeout", label: "시간 초과" },
+];
+
+// Select 안 허용글자문자열 value,따라서「없음분류」에서필터기、새로 생성단량이동
+// 개값,제출후 null。
+const UNCATEGORIZED_VALUE = "uncategorized";
+
+// 일시정지 = 비미일시정지,백엔드와 applyTaskControlWithCause 일치
+// (done/failed/timeout 를);paused 재개。행내버튼·량제어이,
+// 않음개、개안 。
+const PAUSABLE_STATUSES = new Set<TaskStatus>(["created", "queued", "running"]);
+const ARCHIVABLE_STATUSES = new Set<TaskStatus>(["paused", "done", "failed", "timeout"]);
+
+function taskControlAction(status: TaskStatus): "pause" | "resume" | null {
+ if (status === "paused") return "resume";
+ if (PAUSABLE_STATUSES.has(status)) return "pause";
+ return null;
+}
+
+type TaskSortField = "id" | "created" | "duration" | "status";
+
+const TASK_SORT_FIELDS: readonly TaskSortField[] = ["id", "created", "duration", "status"];
+const TASK_SORT_PREFERENCE_KEY = "artex_task_list_sort";
+const TASK_FILTER_PREFERENCE_KEY = "artex_task_list_filters";
+
+const TASK_STATUS_RANK = new Map(STATUS_OPTIONS.map((option, index) => [option.value, index]));
+
+function taskIsPinned(task: Task): boolean {
+ return task.pinned ?? Boolean(task.pinned_at);
+}
+
+function compareTaskIDs(left: string, right: string): number {
+ return left.localeCompare(right, undefined, { numeric: true, sensitivity: "base" });
+}
+
+function taskCreatedUnix(task: Task): number {
+ if (task.created_unix) return task.created_unix;
+ const parsed = Date.parse(task.created_at);
+ return Number.isNaN(parsed) ? 0 : Math.floor(parsed / 1000);
+}
+
+function compareTasks(left: Task, right: Task, field: TaskSortField, direction: SortDirection, nowSec: number): number {
+ const leftPinned = taskIsPinned(left);
+ const rightPinned = taskIsPinned(right);
+ if (leftPinned !== rightPinned) return leftPinned ? -1 : 1;
+ if (leftPinned && left.pinned_at !== right.pinned_at) {
+ return (right.pinned_at ?? "").localeCompare(left.pinned_at ?? "");
+ }
+
+ let compared = 0;
+ switch (field) {
+ case "created":
+ compared = taskCreatedUnix(left) - taskCreatedUnix(right);
+ break;
+ case "duration":
+ compared = taskDuration(left, nowSec) - taskDuration(right, nowSec);
+ break;
+ case "status":
+ compared = (TASK_STATUS_RANK.get(left.status) ?? 0) - (TASK_STATUS_RANK.get(right.status) ?? 0);
+ break;
+ default:
+ compared = compareTaskIDs(left.id, right.id);
+ }
+ if (compared !== 0) return direction === "asc" ? compared : -compared;
+ return -compareTaskIDs(left.id, right.id);
+}
+
+export default function TasksPage() {
+ const [activeTab, setActiveTab] = React.useState("current");
+ const [tasks, setTasks] = React.useState<Task[]>([]);
+ const [categories, setCategories] = React.useState<TaskCategory[]>([]);
+ const [categoriesLoaded, setCategoriesLoaded] = React.useState(false);
+ const [query, setQuery] = React.useState("");
+ const [statusFilter, setStatusFilter] = React.useState<TaskStatus | "all">("all");
+ const [categoryFilter, setCategoryFilter] = React.useState("all");
+ const [filtersHydrated, setFiltersHydrated] = React.useState(false);
+ const [sortPreference, setSortPreference] = useStoredSortPreference(
+ TASK_SORT_PREFERENCE_KEY,
+ TASK_SORT_FIELDS,
+ "id",
+ "desc",
+ );
+ const { field: sortField, direction: sortDirection } = sortPreference;
+ const [page, setPage] = React.useState(1);
+ const [pageSize, setPageSize] = React.useState(20);
+ const [nowSec, setNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
+ const [batchControlling, setBatchControlling] = React.useState<"pause" | "resume" | null>(null);
+ const [movingCategory, setMovingCategory] = React.useState(false);
+
+ React.useEffect(() => {
+ const raw = getLocalStorageValue(TASK_FILTER_PREFERENCE_KEY);
+ if (raw) {
+ try {
+ const parsed = JSON.parse(raw) as { status?: unknown; category?: unknown };
+ if (parsed.status === "all" || STATUS_OPTIONS.some((option) => option.value === parsed.status)) {
+ setStatusFilter(parsed.status as TaskStatus | "all");
+ }
+ if (
+ typeof parsed.category === "string" &&
+ (parsed.category === "all" || parsed.category === UNCATEGORIZED_VALUE || /^\d+$/.test(parsed.category))
+ ) {
+ setCategoryFilter(parsed.category);
+ }
+ } catch {
+ // Ignore malformed or legacy preferences and retain the defaults.
+ }
+ }
+ setFiltersHydrated(true);
+ }, []);
+
+ React.useEffect(() => {
+ if (!filtersHydrated) return;
+ setLocalStorageValue(
+ TASK_FILTER_PREFERENCE_KEY,
+ JSON.stringify({ status: statusFilter, category: categoryFilter }),
+ );
+ }, [categoryFilter, filtersHydrated, statusFilter]);
+
+ const filtered = React.useMemo(() => {
+ const q = query.trim().toLowerCase();
+ return tasks.filter((t) => {
+ if (statusFilter !== "all" && t.status !== statusFilter) return false;
+ if (categoryFilter === UNCATEGORIZED_VALUE && t.category_id != null) return false;
+ if (
+ categoryFilter !== "all" &&
+ categoryFilter !== UNCATEGORIZED_VALUE &&
+ String(t.category_id) !== categoryFilter
+ )
+ return false;
+ if (!q) return true;
+ return (
+ (t.name ?? "").toLowerCase().includes(q) ||
+ (t.category_name ?? "").toLowerCase().includes(q) ||
+ t.description.toLowerCase().includes(q) ||
+ t.goal.toLowerCase().includes(q) ||
+ t.id.toLowerCase().includes(q)
+ );
+ });
+ }, [tasks, query, statusFilter, categoryFilter]);
+
+ const sortNowSec = sortField === "duration" ? nowSec : 0;
+ const ordered = React.useMemo(() => {
+ return [...filtered].sort((left, right) => compareTasks(left, right, sortField, sortDirection, sortNowSec));
+ }, [filtered, sortDirection, sortField, sortNowSec]);
+
+ const sortTasksBy = React.useCallback(
+ (field: TaskSortField) => {
+ setSortPreference((current) => {
+ if (current.field !== field) return { field, direction: "desc" };
+ return { field, direction: current.direction === "asc" ? "desc" : "asc" };
+ });
+ },
+ [setSortPreference],
+ );
+
+ // reset to page 1 whenever filters or ordering change
+ // biome-ignore lint/correctness/useExhaustiveDependencies: both filters intentionally reset pagination.
+ React.useEffect(() => {
+ setPage(1);
+ }, [query, statusFilter, categoryFilter, sortField, sortDirection]);
+
+ const paginated = React.useMemo(
+ () => ordered.slice((page - 1) * pageSize, page * pageSize),
+ [ordered, page, pageSize],
+ );
+
+ // 다중 선택삭제:선택페이지/필터보존,에서작업(또는후더 이상반환)축소。
+ const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set());
+
+ React.useEffect(() => {
+ setSelectedIds((prev) => {
+ if (prev.size === 0) return prev;
+ const live = new Set(tasks.map((t) => t.id));
+ const next = new Set([...prev].filter((id) => live.has(id)));
+ return next.size === prev.size ? prev : next;
+ });
+ }, [tasks]);
+
+ const toggleSelected = React.useCallback((id: string, checked: boolean) => {
+ setSelectedIds((prev) => {
+ const next = new Set(prev);
+ if (checked) next.add(id);
+ else next.delete(id);
+ return next;
+ });
+ }, []);
+
+ const pageIds = React.useMemo(() => paginated.map((t) => t.id), [paginated]);
+ const pageSelectedCount = React.useMemo(
+ () => pageIds.filter((id) => selectedIds.has(id)).length,
+ [pageIds, selectedIds],
+ );
+ let headerChecked: boolean | "indeterminate" = false;
+ if (pageIds.length > 0 && pageSelectedCount === pageIds.length) {
+ headerChecked = true;
+ } else if (pageSelectedCount > 0) {
+ headerChecked = "indeterminate";
+ }
+
+ const toggleSelectedPage = React.useCallback(
+ (checked: boolean) => {
+ setSelectedIds((prev) => {
+ const next = new Set(prev);
+ for (const id of pageIds) {
+ if (checked) next.add(id);
+ else next.delete(id);
+ }
+ return next;
+ });
+ },
+ [pageIds],
+ );
+
+ // lastRef holds the previous poll's serialized payload: the list is re-fetched every
+ // POLL_MS but usually comes back unchanged, and setTasks on an identical payload would
+ // re-render the whole page for nothing. Bail out when it matches.
+ const lastRef = React.useRef<string>("");
+
+ const load = React.useCallback(() => {
+ api
+ .tasks()
+ .then((r) => {
+ const next = r.tasks.map((t) => (t.id === r.active ? { ...t, active: true } : t));
+ const sig = JSON.stringify(next);
+ if (sig === lastRef.current) return;
+ lastRef.current = sig;
+ setTasks(next);
+ })
+ .catch(() => {
+ // Polling is best-effort; the next interval retries automatically.
+ });
+ }, []);
+
+ const loadCategories = React.useCallback(() => {
+ api
+ .taskCategories()
+ .then((next) => {
+ setCategories(next);
+ setCategoriesLoaded(true);
+ })
+ .catch(() => {
+ // Category management remains retryable without blocking the task list.
+ });
+ }, []);
+
+ React.useEffect(() => {
+ load();
+ loadCategories();
+ const i = setInterval(load, POLL_MS);
+ return () => clearInterval(i);
+ }, [load, loadCategories]);
+
+ const refreshCategoriesAndTasks = React.useCallback(() => {
+ lastRef.current = "";
+ loadCategories();
+ load();
+ }, [load, loadCategories]);
+
+ const applyTaskCategoryMove = React.useCallback(
+ (taskID: string, category: TaskCategory | null) => {
+ setTasks((current) => {
+ const next = current.map((task) =>
+ task.id === taskID ? { ...task, category_id: category?.id, category_name: category?.name } : task,
+ );
+ lastRef.current = JSON.stringify(next);
+ return next;
+ });
+ loadCategories();
+ },
+ [loadCategories],
+ );
+
+ React.useEffect(() => {
+ if (!categoriesLoaded) return;
+ if (categoryFilter === "all" || categoryFilter === UNCATEGORIZED_VALUE) return;
+ if (!categories.some((category) => String(category.id) === categoryFilter)) setCategoryFilter("all");
+ }, [categories, categoriesLoaded, categoryFilter]);
+
+ // 에서 running 작업매초 tick——그「실행 시간」는값, tick
+ // 。
+ const hasRunning = React.useMemo(() => tasks.some((t) => t.status === "running"), [tasks]);
+
+ // tick every second so running tasks' 실행 시간 counts up live.
+ React.useEffect(() => {
+ if (!hasRunning) return;
+ setNowSec(Math.floor(Date.now() / 1000));
+ const i = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
+ return () => clearInterval(i);
+ }, [hasRunning]);
+
+ const deleteTask = React.useCallback(
+ async (id: string, options: DeleteTaskOptions) => {
+ try {
+ const result = await api.deleteTask(id, options);
+ if (result.cleanup_warning) {
+ toast.warning(`${deleteSummary(result)}; 일부 외부 데이터 정리가 완료되지 않았습니다: ${result.cleanup_warning}`);
+ } else {
+ toast.success(deleteSummary(result));
+ }
+ load();
+ } catch (e) {
+ toast.error("삭제 실패: " + (e as Error).message);
+ throw e;
+ }
+ },
+ [load],
+ );
+
+ // controlTask 는행내일시정지/재개:량 controlTasksBatch,단행단작업API,
+ // 「량」。비우기 lastRef 하한 번폴링동일단,그렇지 않으면상태
+ // 、버튼없음。
+ const controlTask = React.useCallback(
+ async (id: string, action: "pause" | "resume") => {
+ try {
+ const result = await api.controlTask(id, action);
+ toast.success(
+ action === "pause" ? `작업 #${id} 일시정지` : `작업 #${id} 재개됨${result.queued ? ", 대기열에 들어갔습니다" : ""}`,
+ );
+ } catch (e) {
+ toast.error(`${action === "pause" ? "일시정지" : "재개"}실패：${(e as Error).message}`);
+ } finally {
+ // 없음새로고침:실패다는상태가 변경됨,신버튼까지。
+ lastRef.current = "";
+ load();
+ }
+ },
+ [load],
+ );
+
+ const renameTask = React.useCallback(
+ async (task: Task, name: string) => {
+ try {
+ await api.renameTask(task.id, name);
+ toast.success(`작업 #${task.id} 이름이 변경되었습니다`);
+ lastRef.current = "";
+ load();
+ } catch (error) {
+ toast.error(`이름 변경 실패: ${(error as Error).message}`);
+ throw error;
+ }
+ },
+ [load],
+ );
+
+ const toggleTaskPinned = React.useCallback(
+ async (task: Task) => {
+ const pinned = taskIsPinned(task);
+ try {
+ await api.pinTask(task.id, !pinned);
+ toast.success(pinned ? `작업 #${task.id} 고정 해제됨` : `작업 #${task.id} 고정됨`);
+ lastRef.current = "";
+ load();
+ } catch (error) {
+ toast.error(`${pinned ? "고정 해제" : "고정"}실패：${(error as Error).message}`);
+ throw error;
+ }
+ },
+ [load],
+ );
+
+ const queueTaskArchive = React.useCallback(
+ async (task: Task) => {
+ try {
+ await api.archiveTask(task.id);
+ toast.success(`작업 #${task.id}이(가) 보관 대기열에 들어갔습니다`);
+ setActiveTab("archived");
+ lastRef.current = "";
+ load();
+ } catch (error) {
+ toast.error(`보관 실패：${(error as Error).message}`);
+ throw error;
+ }
+ },
+ [load],
+ );
+
+ // deleteTasks 개삭제작업:후없음량API,단차삭제자산/트래픽/파일,
+ // 행실행한 번후;성공부터선택됨제거,실패보존재시도。
+ const deleteTasks = React.useCallback(
+ async (ids: string[], options: DeleteTaskOptions, onProgress: (done: number) => void) => {
+ const total: DeleteCounts = {
+ assets_deleted: 0,
+ assets_detached: 0,
+ traffic_deleted: 0,
+ files_deleted: false,
+ findings_deleted: 0,
+ llm_records_deleted: 0,
+ };
+ const deleted: string[] = [];
+ const failed: { id: string; message: string }[] = [];
+ const warnings: string[] = [];
+
+ for (const id of ids) {
+ try {
+ const r = await api.deleteTask(id, options);
+ total.assets_deleted += r.assets_deleted;
+ total.assets_detached += r.assets_detached;
+ total.traffic_deleted += r.traffic_deleted;
+ total.files_deleted = total.files_deleted || r.files_deleted;
+ total.findings_deleted += r.findings_deleted;
+ total.llm_records_deleted += r.llm_records_deleted;
+ if (r.cleanup_warning) warnings.push(`#${id}：${r.cleanup_warning}`);
+ deleted.push(id);
+ } catch (e) {
+ failed.push({ id, message: (e as Error).message });
+ }
+ onProgress(deleted.length + failed.length);
+ }
+
+ if (deleted.length > 0) {
+ setSelectedIds((prev) => {
+ const next = new Set(prev);
+ for (const id of deleted) next.delete(id);
+ return next;
+ });
+ const details = deleteDetails(total);
+ const summary = `${deleted.length}개 작업 삭제됨` + (details.length > 0 ? `（${details.join("，")}）` : "");
+ if (warnings.length > 0) {
+ toast.warning(`${summary}; 일부 외부 데이터 정리가 완료되지 않았습니다: ${warnings.join("；")}`);
+ } else {
+ toast.success(summary);
+ }
+ }
+ if (failed.length > 0) {
+ const head = failed
+ .slice(0, 3)
+ .map((f) => `#${f.id}（${f.message}）`)
+ .join("；");
+ toast.error(`${failed.length}개 작업삭제 실패: ${head}${failed.length > 3 ? " 외" : ""}`);
+ }
+ load();
+ },
+ [load],
+ );
+
+ const selectedTasks = React.useMemo(() => tasks.filter((task) => selectedIds.has(task.id)), [tasks, selectedIds]);
+ const pausableTaskIDs = React.useMemo(
+ () => selectedTasks.filter((task) => taskControlAction(task.status) === "pause").map((task) => task.id),
+ [selectedTasks],
+ );
+ const resumableTaskIDs = React.useMemo(
+ () => selectedTasks.filter((task) => taskControlAction(task.status) === "resume").map((task) => task.id),
+ [selectedTasks],
+ );
+ const archivableTaskIDs = React.useMemo(
+ () => selectedTasks.filter((task) => ARCHIVABLE_STATUSES.has(task.status) && !task.queued).map((task) => task.id),
+ [selectedTasks],
+ );
+
+ const archiveSelectedTasks = React.useCallback(async () => {
+ if (archivableTaskIDs.length === 0) return;
+ const result = await api.archiveTasks(archivableTaskIDs);
+ const succeeded = result.items.filter((item) => item.ok);
+ const failed = result.items.filter((item) => !item.ok);
+ if (succeeded.length > 0) toast.success(`${succeeded.length}개 작업이 보관 대기열에 추가됨`);
+ if (failed.length > 0) {
+ toast.error(
+ `${failed.length}개 작업을 보관할 수 없음: ${failed
+ .slice(0, 3)
+ .map((item) => `#${item.id}（${item.error || "상태가 변경됨"}）`)
+ .join("；")}`,
+ );
+ }
+ setSelectedIds(new Set());
+ setActiveTab("archived");
+ lastRef.current = "";
+ load();
+ }, [archivableTaskIDs, load]);
+
+ const controlSelectedTasks = React.useCallback(
+ async (action: "pause" | "resume", ids: string[]) => {
+ if (ids.length === 0 || batchControlling) return;
+ if (ids.length > 100) {
+ toast.error("한 번에 최대 100개 작업까지 제어할 수 있습니다");
+ return;
+ }
+ setBatchControlling(action);
+ try {
+ const result = await api.controlTasksBatch(ids, action);
+ const succeeded = result.items.filter((item) => item.ok);
+ const failed = result.items.filter((item) => !item.ok);
+ if (succeeded.length > 0) {
+ toast.success(
+ action === "pause"
+ ? `${succeeded.length}개 작업 일시정지됨`
+ : `재개됨 ${succeeded.length}개 작업${succeeded.some((item) => item.queued) ? ", 일부 작업이 대기열에 들어갔습니다" : ""}`,
+ );
+ }
+ if (failed.length > 0) {
+ const details = failed
+ .slice(0, 3)
+ .map((item) => `#${item.id}（${item.error || "상태가 변경됨"}）`)
+ .join("；");
+ toast.error(`${failed.length}개 작업 제어 실패: ${details}${failed.length > 3 ? " 외" : ""}`);
+ }
+ lastRef.current = "";
+ load();
+ } catch (error) {
+ toast.error(`${action === "pause" ? "일괄 일시정지" : "일괄 재개"}실패：${(error as Error).message}`);
+ } finally {
+ setBatchControlling(null);
+ }
+ },
+ [batchControlling, load],
+ );
+
+ // 후분류에서개，따라서실패건가능는후작업。
+ const moveSelectedTasksCategory = React.useCallback(
+ async (categoryID?: number) => {
+ const ids = [...selectedIds];
+ if (ids.length === 0 || movingCategory) return;
+ if (ids.length > 100) {
+ toast.error("한 번에 최대 100개 작업의 분류만 변경할 수 있습니다");
+ return;
+ }
+ setMovingCategory(true);
+ try {
+ const result = await api.updateTasksCategory(ids, categoryID);
+ const succeeded = result.items.filter((item) => item.ok);
+ const failed = result.items.filter((item) => !item.ok);
+ const target = result.category?.name ?? "미분류";
+ if (succeeded.length > 0) {
+ toast.success(`${succeeded.length}개 작업이 「${target}」으로 이동됨`);
+ setSelectedIds(new Set());
+ }
+ if (failed.length > 0) {
+ const details = failed
+ .slice(0, 3)
+ .map((item) => `#${item.id}（${item.error || "작업이 존재하지 않음"}）`)
+ .join("；");
+ toast.error(`${failed.length}개 작업 이동 실패: ${details}${failed.length > 3 ? " 외" : ""}`);
+ }
+ refreshCategoriesAndTasks();
+ } catch (error) {
+ toast.error(`분류 변경 실패：${(error as Error).message}`);
+ } finally {
+ setMovingCategory(false);
+ }
+ },
+ [movingCategory, refreshCategoriesAndTasks, selectedIds],
+ );
+
+ return (
+ <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
+ <TabsList className="mx-4 lg:mx-6">
+ <TabsTrigger value="current">현재작업</TabsTrigger>
+ <TabsTrigger value="archived">보관됨</TabsTrigger>
+ </TabsList>
+ <TabsContent value="current">
+ <Card>
+ <CardContent className="flex flex-col gap-4 px-0 pt-6">
+ <div className="flex flex-wrap items-center gap-2 px-4 lg:px-6">
+ <div className="relative w-full sm:max-w-xs">
+ <SearchIcon className="text-muted-foreground pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2" />
+ <Input
+ placeholder="검색설명 / 목표 / ID"
+ value={query}
+ onChange={(e) => setQuery(e.target.value)}
+ className="pl-8"
+ />
+ {query && (
+ <button
+ type="button"
+ onClick={() => setQuery("")}
+ aria-label="검색 지우기"
+ className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2"
+ >
+ <XIcon className="size-4" />
+ </button>
+ )}
+ </div>
+ <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as TaskStatus | "all")}>
+ <SelectTrigger className="w-36">
+ <SelectValue placeholder="상태" />
+ </SelectTrigger>
+ <SelectContent>
+ <SelectGroup>
+ <SelectItem value="all">전체상태</SelectItem>
+ {STATUS_OPTIONS.map((s) => (
+ <SelectItem key={s.value} value={s.value}>
+ {s.label}
+ </SelectItem>
+ ))}
+ </SelectGroup>
+ </SelectContent>
+ </Select>
+ <Select value={categoryFilter} onValueChange={setCategoryFilter}>
+ <SelectTrigger className="w-40">
+ <SelectValue placeholder="작업 분류" />
+ </SelectTrigger>
+ <SelectContent>
+ <SelectGroup>
+ <SelectItem value="all">전체 분류</SelectItem>
+ <SelectItem value={UNCATEGORIZED_VALUE}>미분류</SelectItem>
+ {categories.map((category) => (
+ <SelectItem key={category.id} value={String(category.id)}>
+ {category.name}
+ </SelectItem>
+ ))}
+ </SelectGroup>
+ </SelectContent>
+ </Select>
+ <span className="text-muted-foreground text-xs tabular-nums">
+ {filtered.length}/{tasks.length} 건
+ </span>
+ {selectedIds.size > 0 && (
+ <>
+ <span className="text-xs tabular-nums">선택됨 {selectedIds.size} 개</span>
+ <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>
+ 취소선택
+ </Button>
+ {pausableTaskIDs.length > 0 && (
+ <Button
+ size="sm"
+ variant="outline"
+ disabled={batchControlling !== null}
+ onClick={() => void controlSelectedTasks("pause", pausableTaskIDs)}
+ >
+ {batchControlling === "pause" ? (
+ <Spinner data-icon="inline-start" />
+ ) : (
+ <PauseIcon data-icon="inline-start" />
+ )}
+ 일시정지 {pausableTaskIDs.length}
+ </Button>
+ )}
+ {resumableTaskIDs.length > 0 && (
+ <Button
+ size="sm"
+ variant="outline"
+ disabled={batchControlling !== null}
+ onClick={() => void controlSelectedTasks("resume", resumableTaskIDs)}
+ >
+ {batchControlling === "resume" ? (
+ <Spinner data-icon="inline-start" />
+ ) : (
+ <PlayIcon data-icon="inline-start" />
+ )}
+ 재개 {resumableTaskIDs.length}
+ </Button>
+ )}
+ {archivableTaskIDs.length > 0 && (
+ <ArchiveConfirmDialog
+ count={archivableTaskIDs.length}
+ onConfirm={archiveSelectedTasks}
+ trigger={
+ <Button size="sm" variant="outline">
+ <ArchiveIcon data-icon="inline-start" />
+ 보관 {archivableTaskIDs.length}
+ </Button>
+ }
+ />
+ )}
+ <MoveTasksCategoryDialog
+ categories={categories}
+ count={selectedIds.size}
+ moving={movingCategory}
+ onMove={moveSelectedTasksCategory}
+ />
+ <BulkDeleteTasksDialog ids={[...selectedIds]} onDelete={deleteTasks} />
+ </>
+ )}
+ <ConcurrencySettingsDialog />
+ <CategoryManagementSheet
+ categories={categories}
+ tasks={tasks}
+ onChanged={refreshCategoriesAndTasks}
+ onTaskMoved={applyTaskCategoryMove}
+ />
+ <CreateTaskSheet
+ tasks={tasks}
+ categories={categories}
+ onCreated={refreshCategoriesAndTasks}
+ onCategoriesChanged={refreshCategoriesAndTasks}
+ />
+ </div>
+
+ {tasks.length === 0 ? (
+ <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
+ 작업이 없습니다. 오른쪽 위 「새 작업」을 눌러 시작하세요.
+ </div>
+ ) : filtered.length === 0 ? (
+ <div className="text-muted-foreground mx-4 flex items-center justify-center rounded-lg border border-dashed py-20 text-sm lg:mx-6">
+ 일치하는 작업이 없습니다.
+ </div>
+ ) : (
+ <Table className="**:data-[slot='table-cell']:px-4 **:data-[slot='table-head']:px-4">
+ <TableHeader className="[&_tr]:border-t">
+ <TableRow>
+ <TableHead className="w-10">
+ <Checkbox
+ checked={headerChecked}
+ onCheckedChange={(checked) => toggleSelectedPage(checked === true)}
+ aria-label="이 페이지의 모든 작업 선택"
+ />
+ </TableHead>
+ <SortableTaskHead
+ field="id"
+ label="ID"
+ activeField={sortField}
+ direction={sortDirection}
+ className="font-mono"
+ onSort={sortTasksBy}
+ />
+ <TableHead>이름</TableHead>
+ <TableHead>설명</TableHead>
+ <TableHead>목표</TableHead>
+ <SortableTaskHead
+ field="status"
+ label="상태"
+ activeField={sortField}
+ direction={sortDirection}
+ onSort={sortTasksBy}
+ />
+ <TableHead className="text-center">목표 진행</TableHead>
+ <TableHead className="text-center" title="치명 / 높음 / 중간 / 낮음">
+ 취약점 <span className="text-muted-foreground font-normal">치명/높음/중간/낮음</span>
+ </TableHead>
+ <TableHead className="text-center">실행 중 Worker</TableHead>
+ <SortableTaskHead
+ field="created"
+ label="생성 시각"
+ activeField={sortField}
+ direction={sortDirection}
+ align="right"
+ onSort={sortTasksBy}
+ />
+ <SortableTaskHead
+ field="duration"
+ label="실행 시간"
+ activeField={sortField}
+ direction={sortDirection}
+ align="right"
+ onSort={sortTasksBy}
+ />
+ <TableHead className="text-right">Token</TableHead>
+ <TableHead className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))]">
+ 작업
+ </TableHead>
+ </TableRow>
+ </TableHeader>
+ <TableBody>
+ {paginated.map((task) => (
+ <TaskRow
+ key={task.id}
+ task={task}
+ // running 작업 nowSec;그행 0 —— props 안 ,memo 으로하매초 tick
+ // ,에서행。
+ nowSec={task.status === "running" ? nowSec : 0}
+ onDelete={deleteTask}
+ onControl={controlTask}
+ onRename={renameTask}
+ onTogglePinned={toggleTaskPinned}
+ onArchive={queueTaskArchive}
+ selected={selectedIds.has(task.id)}
+ onSelectedChange={toggleSelected}
+ />
+ ))}
+ </TableBody>
+ </Table>
+ )}
+ <TablePagination
+ page={page}
+ pageSize={pageSize}
+ total={filtered.length}
+ onPageChange={setPage}
+ onPageSizeChange={(nextPageSize) => {
+ setPageSize(nextPageSize);
+ setPage(1);
+ }}
+ />
+ </CardContent>
+ </Card>
+ </TabsContent>
+ <TabsContent value="archived">
+ <TaskArchivesPanel onChanged={load} />
+ </TabsContent>
+ </Tabs>
+ );
+}
+
+function taskSortIcon(active: boolean, direction: SortDirection) {
+ if (!active) {
+ return <ArrowUpDownIcon className="size-3.5 opacity-40 transition-opacity group-hover/sort:opacity-100" />;
+ }
+ if (direction === "asc") return <ArrowUpIcon className="size-3.5" />;
+ return <ArrowDownIcon className="size-3.5" />;
+}
+
+function SortableTaskHead({
+ field,
+ label,
+ activeField,
+ direction,
+ align = "left",
+ className,
+ onSort,
+}: {
+ field: TaskSortField;
+ label: string;
+ activeField: TaskSortField;
+ direction: SortDirection;
+ align?: "left" | "right";
+ className?: string;
+ onSort: (field: TaskSortField) => void;
+}) {
+ const active = activeField === field;
+ let ariaSort: React.AriaAttributes["aria-sort"] = "none";
+ if (active) ariaSort = direction === "asc" ? "ascending" : "descending";
+
+ let actionLabel = `${label} 내림차순 정렬`;
+ if (active) actionLabel = `${label} ${direction === "asc" ? "오름차순" : "내림차순"}, 클릭하여 정렬 방향 전환`;
+
+ return (
+ <TableHead className={className} aria-sort={ariaSort}>
+ <button
+ type="button"
+ className={cn(
+ "group/sort inline-flex h-full w-full items-center gap-1 outline-none focus-visible:underline",
+ align === "right" && "justify-end",
+ )}
+ aria-label={actionLabel}
+ onClick={() => onSort(field)}
+ >
+ <span>{label}</span>
+ {taskSortIcon(active, direction)}
+ </button>
+ </TableHead>
+ );
+}
+
+function ConcurrencySettingsDialog() {
+ const [open, setOpen] = React.useState(false);
+ const [enabled, setEnabled] = React.useState(false);
+ const [limit, setLimit] = React.useState("5");
+ const [loading, setLoading] = React.useState(false);
+ const [saving, setSaving] = React.useState(false);
+
+ React.useEffect(() => {
+ if (!open) return;
+ setLoading(true);
+ api
+ .settings()
+ .then((settings) => {
+ setEnabled(!!settings.task_concurrency_enabled);
+ setLimit(String(settings.task_concurrency_limit ?? 5));
+ })
+ .catch(() => {
+ // Keep the dialog usable with defaults; reopening retries the request.
+ })
+ .finally(() => setLoading(false));
+ }, [open]);
+
+ async function save() {
+ const nextLimit = Math.max(1, Math.floor(Number(limit) || 5));
+ setSaving(true);
+ try {
+ await api.setSettings({ task_concurrency_enabled: enabled, task_concurrency_limit: nextLimit });
+ toast.success(enabled ? `동시 실행 제한 활성화: 최대 ${nextLimit}개 작업` : "작업 동시 실행 제한 비활성화");
+ setOpen(false);
+ } catch (error) {
+ toast.error(`저장 실패: ${(error as Error).message}`);
+ } finally {
+ setSaving(false);
+ }
+ }
+
+ return (
+ <Dialog open={open} onOpenChange={setOpen}>
+ <DialogTrigger asChild>
+ <Button size="sm" variant="outline" className="ml-auto" aria-label="작업 동시 실행 설정">
+ <SlidersHorizontalIcon /> 동시 실행 설정
+ </Button>
+ </DialogTrigger>
+ <DialogContent className="sm:max-w-md">
+ <DialogHeader>
+ <DialogTitle>작업 동시 실행 제한</DialogTitle>
+ <DialogDescription>
+ 동시에 실행되는 작업 수를 제한합니다. 상한에 도달하면 새 작업은 생성 순서대로 대기하고, 빈 슬롯이 생기면 자동으로 시작됩니다.
+ </DialogDescription>
+ </DialogHeader>
+ <div className="grid gap-5 py-2">
+ <div className="flex items-center justify-between gap-4">
+ <div className="grid gap-1">
+ <Label htmlFor="task-concurrency-enabled">켜짐작업 동시 실행 제한</Label>
+ <span className="text-muted-foreground text-xs">기본꺼짐</span>
+ </div>
+ <Switch id="task-concurrency-enabled" checked={enabled} onCheckedChange={setEnabled} disabled={loading} />
+ </div>
+ {enabled && (
+ <div className="grid gap-2">
+ <Label htmlFor="task-concurrency-limit">동시 실행 상한</Label>
+ <Input
+ id="task-concurrency-limit"
+ type="number"
+ min={1}
+ className="w-32"
+ value={limit}
+ onChange={(event) => setLimit(event.target.value)}
+ disabled={loading}
+ />
+ </div>
+ )}
+ </div>
+ <DialogFooter>
+ <DialogClose asChild>
+ <Button variant="outline">취소</Button>
+ </DialogClose>
+ <Button onClick={save} disabled={loading || saving}>
+ {saving && <Loader2Icon className="animate-spin" />} 저장
+ </Button>
+ </DialogFooter>
+ </DialogContent>
+ </Dialog>
+ );
+}
+
+// TaskRow renders one row of the task table. Memoized so the per-second 실행 시간 tick and
+// the POLL_MS list refresh only re-render the rows whose data actually moved — a table page
+// is 20 rows × (StatusBadge + Link + a Radix AlertDialog tree), far too heavy to rebuild
+// wholesale on every parent render.
+const TaskRow = React.memo(function TaskRow({
+ task,
+ nowSec,
+ onDelete,
+ onControl,
+ onRename,
+ onTogglePinned,
+ onArchive,
+ selected,
+ onSelectedChange,
+}: {
+ task: Task;
+ nowSec: number;
+ onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
+ onControl: (id: string, action: "pause" | "resume") => Promise<void>;
+ onRename: (task: Task, name: string) => Promise<void>;
+ onTogglePinned: (task: Task) => Promise<void>;
+ onArchive: (task: Task) => Promise<void>;
+ selected: boolean;
+ onSelectedChange: (id: string, checked: boolean) => void;
+}) {
+ return (
+ <TableRow className="group border-border/60" data-state={selected ? "selected" : undefined}>
+ <TableCell>
+ <Checkbox
+ checked={selected}
+ onCheckedChange={(checked) => onSelectedChange(task.id, checked === true)}
+ aria-label={`선택작업 ${task.id}`}
+ />
+ </TableCell>
+ <TableCell>
+ <code className="bg-muted rounded px-1.5 py-0.5 font-mono text-xs">{task.id}</code>
+ </TableCell>
+ <TableCell className="font-medium">
+ <div className="flex max-w-xs items-center gap-2">
+ <TaskNameEditor task={task} onRename={onRename} />
+ {task.active && <StarIcon className="size-4 shrink-0 fill-amber-400 text-amber-400" />}
+ {taskIsPinned(task) && <PinIcon className="text-primary size-4 shrink-0" aria-label="고정됨" />}
+ </div>
+ </TableCell>
+ <TableCell className="text-muted-foreground max-w-40">
+ <Link
+ href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
+ className="block truncate rounded-sm hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+ title={task.description}
+ >
+ {task.description}
+ </Link>
+ </TableCell>
+ <TableCell className="text-muted-foreground max-w-40 truncate" title={task.goal}>
+ {task.goal}
+ </TableCell>
+ <TableCell>
+ <StatusBadge domain="task" value={task.status} dot />
+ </TableCell>
+ <TableCell className="text-muted-foreground text-center text-xs tabular-nums">
+ {typeof task.goals_total === "number" && task.goals_total > 0 ? (
+ `${task.goals_met}/${task.goals_total}`
+ ) : (
+ <span className="text-muted-foreground">—</span>
+ )}
+ </TableCell>
+ <TableCell className="text-center text-xs tabular-nums">
+ {(() => {
+ const f = task.findings;
+ const total = f ? f.critical + f.high + f.medium + f.low : 0;
+ if (!f || total === 0) return <span className="text-muted-foreground">0</span>;
+ const seg = (n: number, cls: string) => (
+ <span className={n > 0 ? cls : "text-muted-foreground"}>{n}</span>
+ );
+ return (
+ <span className="font-medium whitespace-nowrap" title="치명 / 높음 / 중간 / 낮음">
+ {seg(f.critical, "text-rose-600 dark:text-rose-400")}
+ <span className="text-muted-foreground">/</span>
+ {seg(f.high, "text-red-600 dark:text-red-400")}
+ <span className="text-muted-foreground">/</span>
+ {seg(f.medium, "text-amber-600 dark:text-amber-400")}
+ <span className="text-muted-foreground">/</span>
+ {seg(f.low, "text-slate-600 dark:text-slate-400")}
+ </span>
+ );
+ })()}
+ </TableCell>
+ <TableCell className="text-center text-xs tabular-nums">
+ {task.in_flight && task.in_flight > 0 ? (
+ <span className="text-foreground font-medium">{task.in_flight}</span>
+ ) : (
+ <span className="text-muted-foreground">0</span>
+ )}
+ </TableCell>
+ <TableCell className="text-muted-foreground text-right text-xs whitespace-nowrap tabular-nums">
+ {fmtDateTime(task.created_unix)}
+ </TableCell>
+ <TableCell className="text-right text-xs whitespace-nowrap tabular-nums">
+ {(() => {
+ const secs = taskDuration(task, nowSec);
+ if (secs <= 0) return <span className="text-muted-foreground">—</span>;
+ return (
+ <span className={task.status === "running" ? "text-foreground" : "text-muted-foreground"}>
+ {fmtDuration(secs)}
+ </span>
+ );
+ })()}
+ </TableCell>
+ <TableCell
+ className="text-right text-xs whitespace-nowrap tabular-nums"
+ title={
+ task.tokens
+ ? `입력 ${task.tokens.input_tokens} · 캐시 ${task.tokens.cache_read_tokens} · 출력 ${task.tokens.output_tokens}`
+ : undefined
+ }
+ >
+ {task.tokens ? (
+ <span className="text-muted-foreground">
+ 입력 <span className="text-foreground">{fmtTokens(task.tokens.input_tokens)}</span>
+ {" · 캐시 "}
+ <span className="text-foreground">{fmtTokens(task.tokens.cache_read_tokens)}</span>
+ {" · 출력 "}
+ <span className="text-foreground">{fmtTokens(task.tokens.output_tokens)}</span>
+ </span>
+ ) : (
+ "—"
+ )}
+ </TableCell>
+ <TableCell className="sticky right-0 z-10 bg-card text-right shadow-[-1px_0_0_0_hsl(var(--border))] group-hover:bg-muted/50">
+ <div className="flex items-center justify-end gap-0.5">
+ <Button size="icon" variant="ghost" asChild aria-label="작업 보기상세" title="작업 보기상세">
+ <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}>
+ <EyeIcon />
+ </Link>
+ </Button>
+ <TaskControlButton task={task} onControl={onControl} />
+ <TaskPinAction task={task} onTogglePinned={onTogglePinned} />
+ <TaskArchiveAction task={task} onArchive={onArchive} />
+ <DeleteTaskDialog task={task} onDelete={onDelete} />
+ </div>
+ </TableCell>
+ </TableRow>
+ );
+});
+
+function TaskNameEditor({ task, onRename }: { task: Task; onRename: (task: Task, name: string) => Promise<void> }) {
+ const [editing, setEditing] = React.useState(false);
+ const [name, setName] = React.useState(task.name ?? "");
+ const [saving, setSaving] = React.useState(false);
+ const inputRef = React.useRef<HTMLInputElement>(null);
+ const cancelOnBlurRef = React.useRef(false);
+
+ React.useEffect(() => {
+ if (!editing) setName(task.name ?? "");
+ }, [editing, task.name]);
+
+ async function finishEditing() {
+ if (cancelOnBlurRef.current) {
+ cancelOnBlurRef.current = false;
+ setName(task.name ?? "");
+ setEditing(false);
+ return;
+ }
+
+ const next = name.trim();
+ if (!next || next === task.name?.trim()) {
+ setName(task.name ?? "");
+ setEditing(false);
+ return;
+ }
+
+ setSaving(true);
+ try {
+ await onRename(task, next);
+ setEditing(false);
+ } catch {
+ requestAnimationFrame(() => inputRef.current?.focus());
+ } finally {
+ setSaving(false);
+ }
+ }
+
+ if (editing) {
+ return (
+ <div className="flex min-w-0 items-center gap-1">
+ <Input
+ ref={inputRef}
+ value={name}
+ maxLength={200}
+ autoFocus
+ disabled={saving}
+ aria-label={`작업 #${task.id} 이름`}
+ className="h-7 min-w-28 max-w-48 px-2 font-medium"
+ onFocus={(event) => event.currentTarget.select()}
+ onChange={(event) => setName(event.target.value)}
+ onBlur={() => void finishEditing()}
+ onKeyDown={(event) => {
+ if (event.key === "Enter") {
+ event.preventDefault();
+ event.currentTarget.blur();
+ } else if (event.key === "Escape") {
+ event.preventDefault();
+ cancelOnBlurRef.current = true;
+ event.currentTarget.blur();
+ }
+ }}
+ />
+ {saving && <Spinner className="shrink-0" />}
+ </div>
+ );
+ }
+
+ return (
+ <div className="flex min-w-0 items-center gap-1">
+ <Link
+ href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`}
+ className="min-w-0 truncate rounded-sm hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+ title={task.name?.trim() ? task.name : task.description}
+ >
+ {task.name?.trim() ? task.name : <span className="text-muted-foreground">이름 없음</span>}
+ </Link>
+ <Button
+ type="button"
+ variant="ghost"
+ size="icon-xs"
+ className="shrink-0 opacity-100 transition-opacity [@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-focus-within:opacity-100 [@media(hover:hover)]:group-hover:opacity-100"
+ aria-label={`작업 #${task.id} 이름 변경`}
+ title="이름 변경"
+ onClick={() => {
+ setName(task.name ?? "");
+ setEditing(true);
+ }}
+ >
+ <PencilIcon />
+ </Button>
+ </div>
+ );
+}
+
+function taskPinIcon(pinning: boolean, pinned: boolean) {
+ if (pinning) return <Spinner />;
+ if (pinned) return <PinOffIcon />;
+ return <PinIcon />;
+}
+
+function TaskPinAction({ task, onTogglePinned }: { task: Task; onTogglePinned: (task: Task) => Promise<void> }) {
+ const [pinning, setPinning] = React.useState(false);
+ const pinned = taskIsPinned(task);
+
+ return (
+ <Button
+ type="button"
+ variant="ghost"
+ size="icon"
+ disabled={pinning}
+ aria-label={pinned ? `고정 해제작업 #${task.id}` : `고정작업 #${task.id}`}
+ title={pinned ? "고정 해제" : "고정"}
+ onClick={async () => {
+ setPinning(true);
+ try {
+ await onTogglePinned(task);
+ } finally {
+ setPinning(false);
+ }
+ }}
+ >
+ {taskPinIcon(pinning, pinned)}
+ </Button>
+ );
+}
+
+// 비: Biome noNestedTernary。
+function taskControlIcon(pending: boolean, action: "pause" | "resume" | null) {
+ if (pending) return <Loader2Icon className="animate-spin" />;
+ if (action === "resume") return <PlayIcon />;
+ return <PauseIcon />;
+}
+
+// TaskControlButton 는행내일시정지/재개토글。작업를 disabled 안 는,
+// 행작업열도일치,버튼않음상태。
+function TaskControlButton({
+ task,
+ onControl,
+}: {
+ task: Task;
+ onControl: (id: string, action: "pause" | "resume") => Promise<void>;
+}) {
+ const [pending, setPending] = React.useState(false);
+ const action = taskControlAction(task.status);
+ const label = action === "resume" ? "재개작업" : "일시정지작업";
+ return (
+ <Button
+ size="icon"
+ variant="ghost"
+ aria-label={label}
+ title={action ? label : "이 상태에서는 일시정지 또는 재개할 수 없습니다"}
+ disabled={!action || pending}
+ onClick={async () => {
+ if (!action) return;
+ setPending(true);
+ try {
+ await onControl(task.id, action);
+ } finally {
+ setPending(false);
+ }
+ }}
+ >
+ {taskControlIcon(pending, action)}
+ </Button>
+ );
+}
+
+function archiveBlockReason(task: Task): string {
+ if (task.queued) return "대기열에 있는 작업은 먼저 일시정지해야 합니다";
+ if (!ARCHIVABLE_STATUSES.has(task.status)) return "실행 중이거나 종료되지 않은 작업은 먼저 일시정지해야 합니다";
+ if (task.archive_blocked_by_task_id) {
+ return `작업이 보관되지 않은 작업 #${task.archive_blocked_by_task_id}에 직접 연결되어 있습니다. 먼저 의존 작업을 보관하세요.`;
+ }
+ return "";
+}
+
+function ArchiveConfirmDialog({
+ count,
+ trigger,
+ onConfirm,
+}: {
+ count: number;
+ trigger: React.ReactNode;
+ onConfirm: () => Promise<void>;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [pending, setPending] = React.useState(false);
+ return (
+ <AlertDialog open={open} onOpenChange={(next) => !pending && setOpen(next)}>
+ <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
+ <AlertDialogContent>
+ <AlertDialogHeader>
+ <AlertDialogTitle>{count === 1 ? "보관작업" : `보관 ${count}개 작업`}</AlertDialogTitle>
+ <AlertDialogDescription className="[overflow-wrap:anywhere]">
+ 보관하면 작업 스케줄이 중지되고 그래프, LLM 이력, 파일 및 전용 자산·트래픽이 로컬 콜드 스토리지로 압축됩니다. 보관이 완료되면 「보관됨」에서 복원할 수 있습니다.
+ </AlertDialogDescription>
+ </AlertDialogHeader>
+ <AlertDialogFooter>
+ <AlertDialogCancel disabled={pending}>취소</AlertDialogCancel>
+ <AlertDialogAction
+ disabled={pending}
+ onClick={async (event) => {
+ event.preventDefault();
+ setPending(true);
+ try {
+ await onConfirm();
+ setOpen(false);
+ } finally {
+ setPending(false);
+ }
+ }}
+ >
+ {pending && <Spinner data-icon="inline-start" />}
+ 확인보관
+ </AlertDialogAction>
+ </AlertDialogFooter>
+ </AlertDialogContent>
+ </AlertDialog>
+ );
+}
+
+function TaskArchiveAction({ task, onArchive }: { task: Task; onArchive: (task: Task) => Promise<void> }) {
+ const reason = archiveBlockReason(task);
+ const trigger = (
+ <Button size="icon" variant="ghost" disabled={Boolean(reason)} aria-label={`보관작업 #${task.id}`}>
+ <ArchiveIcon />
+ </Button>
+ );
+ if (reason) {
+ return (
+ <Tooltip>
+ <TooltipTrigger asChild>
+ <span className="inline-flex">{trigger}</span>
+ </TooltipTrigger>
+ <TooltipContent>{reason}</TooltipContent>
+ </Tooltip>
+ );
+ }
+ return <ArchiveConfirmDialog count={1} trigger={trigger} onConfirm={() => onArchive(task)} />;
+}
+
+const ARCHIVE_PROCESSING_STATES = new Set<TaskArchiveState>([
+ "archive_queued",
+ "archiving",
+ "restore_queued",
+ "restoring",
+ "delete_queued",
+ "deleting",
+]);
+
+const ARCHIVE_FAILED_STATES = new Set<TaskArchiveState>(["archive_failed", "restore_failed", "delete_failed"]);
+
+function archiveStateLabel(state: TaskArchiveState): string {
+ const labels: Record<TaskArchiveState, string> = {
+ archive_queued: " 보관 대기",
+ archiving: "보관 중",
+ archive_failed: "보관 실패",
+ ready: "복원 가능",
+ restore_queued: " 복원 대기",
+ restoring: "복원 중",
+ restore_failed: "복원 실패",
+ delete_queued: " 삭제 대기",
+ deleting: "삭제 중",
+ delete_failed: "삭제실패",
+ };
+ return labels[state];
+}
+
+function ArchiveStateBadge({ state }: { state: TaskArchiveState }) {
+ let variant: "default" | "secondary" | "destructive" | "outline" = "outline";
+ if (state === "ready") variant = "secondary";
+ if (ARCHIVE_PROCESSING_STATES.has(state)) variant = "default";
+ if (ARCHIVE_FAILED_STATES.has(state)) variant = "destructive";
+ return <Badge variant={variant}>{archiveStateLabel(state)}</Badge>;
+}
+
+function formatArchiveBytes(bytes: number): string {
+ if (bytes <= 0) return "—";
+ if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+ if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+ if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+ return `${bytes} B`;
+}
+
+function archiveCompressionLabel(archive: TaskArchive): string {
+ if (archive.original_size <= 0 || archive.compressed_size <= 0) return "—";
+ const saved = Math.max(0, 100 - (archive.compressed_size / archive.original_size) * 100);
+ return `${formatArchiveBytes(archive.compressed_size)} · ${saved.toFixed(0)}% 절약`;
+}
+
+function archiveDataTotal(archive: TaskArchive): number {
+ return Object.values(archive.data_counts).reduce((sum, value) => sum + (Number(value) || 0), 0);
+}
+
+function archiveDate(value?: string): string {
+ if (!value) return "—";
+ const date = new Date(value);
+ if (Number.isNaN(date.getTime())) return "—";
+ return date.toLocaleString();
+}
+
+function ArchiveDeleteDialog({
+ archives,
+ onConfirm,
+ trigger,
+}: {
+ archives: TaskArchive[];
+ onConfirm: () => Promise<void>;
+ trigger: React.ReactNode;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [pending, setPending] = React.useState(false);
+ const rows = archives.reduce((sum, archive) => sum + archiveDataTotal(archive), 0);
+ const bytes = archives.reduce((sum, archive) => sum + archive.compressed_size, 0);
+ return (
+ <AlertDialog open={open} onOpenChange={(next) => !pending && setOpen(next)}>
+ <AlertDialogTrigger asChild>{trigger}</AlertDialogTrigger>
+ <AlertDialogContent>
+ <AlertDialogHeader>
+ <AlertDialogTitle>{archives.length}개 작업 보관을 영구 삭제할까요?</AlertDialogTitle>
+ <AlertDialogDescription className="[overflow-wrap:anywhere]">
+ 약 {formatArchiveBytes(bytes)} 보관 패키지와 {rows.toLocaleString()}건 연관 데이터 스냅샷이 영구 삭제됩니다. 이 작업은 되돌릴 수 없습니다.
+ </AlertDialogDescription>
+ </AlertDialogHeader>
+ <AlertDialogFooter>
+ <AlertDialogCancel disabled={pending}>취소</AlertDialogCancel>
+ <AlertDialogAction
+ variant="destructive"
+ disabled={pending}
+ onClick={async (event) => {
+ event.preventDefault();
+ setPending(true);
+ try {
+ await onConfirm();
+ setOpen(false);
+ } finally {
+ setPending(false);
+ }
+ }}
+ >
+ {pending && <Spinner data-icon="inline-start" />}
+ 영구 삭제
+ </AlertDialogAction>
+ </AlertDialogFooter>
+ </AlertDialogContent>
+ </AlertDialog>
+ );
+}
+
+function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
+ const [archives, setArchives] = React.useState<TaskArchive[]>([]);
+ const [query, setQuery] = React.useState("");
+ const [stateFilter, setStateFilter] = React.useState("all");
+ const [page, setPage] = React.useState(1);
+ const [pageSize, setPageSize] = React.useState(20);
+ const [total, setTotal] = React.useState(0);
+ const [selected, setSelected] = React.useState<Set<number>>(() => new Set());
+ const [loading, setLoading] = React.useState(true);
+ const pendingRestoreIDs = React.useRef(new Set<number>());
+
+ const load = React.useCallback(async () => {
+ try {
+ const result = await api.taskArchives({
+ page,
+ size: pageSize,
+ q: query.trim(),
+ state: stateFilter === "all" ? undefined : stateFilter,
+ });
+ setArchives(result.items);
+ setTotal(result.total);
+ setSelected((current) => {
+ const visible = new Set(result.items.map((archive) => archive.id));
+ return new Set([...current].filter((id) => visible.has(id)));
+ });
+ const pending = [...pendingRestoreIDs.current];
+ if (pending.length > 0) {
+ const states = await Promise.allSettled(pending.map((id) => api.taskArchive(id)));
+ let restored = false;
+ states.forEach((state, index) => {
+ if (state.status !== "rejected" || !(state.reason instanceof Error)) return;
+ if (!state.reason.message.includes("보관존재하지 않음")) return;
+ pendingRestoreIDs.current.delete(pending[index]);
+ restored = true;
+ });
+ if (restored) onChanged();
+ }
+ } catch (error) {
+ toast.error(`보관 목록을 읽지 못했습니다: ${(error as Error).message}`);
+ } finally {
+ setLoading(false);
+ }
+ }, [onChanged, page, pageSize, query, stateFilter]);
+
+ React.useEffect(() => {
+ void load();
+ const timer = setInterval(() => void load(), 2_000);
+ return () => clearInterval(timer);
+ }, [load]);
+
+ const selectable = React.useMemo(
+ () => archives.filter((archive) => !ARCHIVE_PROCESSING_STATES.has(archive.state)),
+ [archives],
+ );
+ const selectedArchives = React.useMemo(
+ () => archives.filter((archive) => selected.has(archive.id)),
+ [archives, selected],
+ );
+ const restorable = selectedArchives.filter(
+ (archive) => archive.state === "ready" || archive.state === "restore_failed",
+ );
+ const deletable = selectedArchives.filter(
+ (archive) => archive.state === "ready" || archive.state === "delete_failed",
+ );
+ const selectedAll = selectable.length > 0 && selectable.every((archive) => selected.has(archive.id));
+ const selectedSome = selectable.some((archive) => selected.has(archive.id));
+
+ const afterAction = React.useCallback(() => {
+ setSelected(new Set());
+ void load();
+ onChanged();
+ }, [load, onChanged]);
+
+ async function restoreMany(items: TaskArchive[]) {
+ try {
+ const result =
+ items.length === 1
+ ? {
+ items: [
+ {
+ id: String(items[0].id),
+ ok: true,
+ queued: true,
+ archive_id: (await api.restoreTaskArchive(items[0].id)).id,
+ },
+ ],
+ }
+ : await api.restoreTaskArchives(items.map((archive) => archive.id));
+ const succeeded = result.items.filter((item) => item.ok).length;
+ const failed = result.items.length - succeeded;
+ for (const item of result.items) {
+ const archiveID = Number(item.archive_id ?? item.id);
+ if (item.ok && Number.isSafeInteger(archiveID) && archiveID > 0) pendingRestoreIDs.current.add(archiveID);
+ }
+ if (succeeded > 0) toast.success(`${succeeded}개 작업이 복원 대기열에 추가됨`);
+ if (failed > 0) toast.error(`${failed}개 작업을 복원할 수 없음`);
+ afterAction();
+ } catch (error) {
+ toast.error(`복원 실패：${(error as Error).message}`);
+ }
+ }
+
+ async function deleteMany(items: TaskArchive[]) {
+ try {
+ const result =
+ items.length === 1
+ ? {
+ items: [
+ {
+ id: String(items[0].id),
+ ok: true,
+ queued: true,
+ archive_id: (await api.deleteTaskArchive(items[0].id)).id,
+ },
+ ],
+ }
+ : await api.deleteTaskArchives(items.map((archive) => archive.id));
+ const succeeded = result.items.filter((item) => item.ok).length;
+ const failed = result.items.length - succeeded;
+ if (succeeded > 0) toast.success(`${succeeded}개 보관이 영구 삭제 대기열에 추가됨`);
+ if (failed > 0) toast.error(`${failed}개 보관을 삭제할 수 없음`);
+ afterAction();
+ } catch (error) {
+ toast.error(`영구 삭제 실패: ${(error as Error).message}`);
+ throw error;
+ }
+ }
+
+ async function retry(archive: TaskArchive) {
+ try {
+ if (archive.state === "archive_failed") await api.archiveTask(String(archive.task_id));
+ if (archive.state === "restore_failed") await api.restoreTaskArchive(archive.id);
+ if (archive.state === "delete_failed") await api.deleteTaskArchive(archive.id);
+ toast.success("처리 대기열에 다시 추가됨");
+ afterAction();
+ } catch (error) {
+ toast.error(`재시도실패：${(error as Error).message}`);
+ }
+ }
+
+ return (
+ <Card>
+ <CardContent className="flex flex-col gap-4 px-0 pt-6">
+ <div className="flex flex-wrap items-center gap-2 px-4 lg:px-6">
+ <div className="relative w-full sm:max-w-xs">
+ <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
+ <Input
+ value={query}
+ onChange={(event) => {
+ setQuery(event.target.value);
+ setPage(1);
+ }}
+ placeholder="검색작업이름 / 설명 / ID"
+ className="pl-8"
+ />
+ </div>
+ <Select
+ value={stateFilter}
+ onValueChange={(value) => {
+ setStateFilter(value);
+ setPage(1);
+ }}
+ >
+ <SelectTrigger className="w-36">
+ <SelectValue placeholder="처리 상태" />
+ </SelectTrigger>
+ <SelectContent>
+ <SelectGroup>
+ <SelectItem value="all">전체상태</SelectItem>
+ <SelectItem value="archive_queued"> 보관 대기</SelectItem>
+ <SelectItem value="archiving">보관 중</SelectItem>
+ <SelectItem value="ready">복원 가능</SelectItem>
+ <SelectItem value="restore_queued"> 복원 대기</SelectItem>
+ <SelectItem value="restoring">복원 중</SelectItem>
+ <SelectItem value="delete_queued"> 삭제 대기</SelectItem>
+ <SelectItem value="deleting">삭제 중</SelectItem>
+ <SelectItem value="archive_failed">보관 실패</SelectItem>
+ <SelectItem value="restore_failed">복원 실패</SelectItem>
+ <SelectItem value="delete_failed">삭제실패</SelectItem>
+ </SelectGroup>
+ </SelectContent>
+ </Select>
+ <span className="text-muted-foreground text-xs tabular-nums">{total} 개보관</span>
+ {selectedArchives.length > 0 && (
+ <>
+ <span className="text-xs tabular-nums">선택됨 {selectedArchives.length} 개</span>
+ {restorable.length > 0 && (
+ <Button size="sm" variant="outline" onClick={() => void restoreMany(restorable)}>
+ <Undo2Icon data-icon="inline-start" />
+ 복원 {restorable.length}
+ </Button>
+ )}
+ {deletable.length > 0 && (
+ <ArchiveDeleteDialog
+ archives={deletable}
+ onConfirm={() => deleteMany(deletable)}
+ trigger={
+ <Button size="sm" variant="destructive">
+ <Trash2Icon data-icon="inline-start" />
+ 영구 삭제 {deletable.length}
+ </Button>
+ }
+ />
+ )}
+ </>
+ )}
+ </div>
+ {loading ? (
+ <div className="flex justify-center py-20">
+ <Spinner />
+ </div>
+ ) : archives.length === 0 ? (
+ <Empty className="mx-4 border border-dashed lg:mx-6">
+ <EmptyHeader>
+ <EmptyTitle>작업 없음보관</EmptyTitle>
+ <EmptyDescription>일시정지되었거나 종료된 작업을 현재 작업 목록에서 보관할 수 있습니다.</EmptyDescription>
+ </EmptyHeader>
+ </Empty>
+ ) : (
+ <Table className="**:data-[slot='table-cell']:px-4 **:data-[slot='table-head']:px-4">
+ <TableHeader className="[&_tr]:border-t">
+ <TableRow>
+ <TableHead className="w-10">
+ <Checkbox
+ checked={selectedAll || (selectedSome ? "indeterminate" : false)}
+ onCheckedChange={(checked) =>
+ setSelected(checked === true ? new Set(selectable.map((archive) => archive.id)) : new Set())
+ }
+ aria-label="현재 페이지 보관 선택"
+ />
+ </TableHead>
+ <TableHead>작업</TableHead>
+ <TableHead>이전 상태</TableHead>
+ <TableHead>분류</TableHead>
+ <TableHead>보관 시각</TableHead>
+ <TableHead>압축 크기</TableHead>
+ <TableHead>데이터량</TableHead>
+ <TableHead className="min-w-44">처리 상태</TableHead>
+ <TableHead className="text-right">작업</TableHead>
+ </TableRow>
+ </TableHeader>
+ <TableBody>
+ {archives.map((archive) => {
+ const processing = ARCHIVE_PROCESSING_STATES.has(archive.state);
+ const canRestore = archive.state === "ready" || archive.state === "restore_failed";
+ const canDelete = archive.state === "ready" || archive.state === "delete_failed";
+ return (
+ <TableRow key={archive.id} data-state={selected.has(archive.id) ? "selected" : undefined}>
+ <TableCell>
+ <Checkbox
+ checked={selected.has(archive.id)}
+ disabled={processing}
+ onCheckedChange={(checked) =>
+ setSelected((current) => {
+ const next = new Set(current);
+ if (checked === true) next.add(archive.id);
+ else next.delete(archive.id);
+ return next;
+ })
+ }
+ aria-label={`선택작업보관 #${archive.task_id}`}
+ />
+ </TableCell>
+ <TableCell className="max-w-sm">
+ <div className="flex min-w-0 flex-col gap-0.5">
+ <span className="truncate font-medium">
+ {archive.task_name || archive.task_description || `작업 #${archive.task_id}`}
+ </span>
+ <span className="text-muted-foreground truncate text-xs">
+ #{archive.task_id} · {archive.task_description}
+ </span>
+ </div>
+ </TableCell>
+ <TableCell>
+ <StatusBadge domain="task" value={archive.original_status} dot />
+ </TableCell>
+ <TableCell className="text-muted-foreground">{archive.category_name || "미분류"}</TableCell>
+ <TableCell className="text-muted-foreground whitespace-nowrap text-xs">
+ {archiveDate(archive.archived_at || archive.requested_at)}
+ </TableCell>
+ <TableCell
+ className="whitespace-nowrap text-xs"
+ title={`압축 전 ${formatArchiveBytes(archive.original_size)}`}
+ >
+ {archiveCompressionLabel(archive)}
+ </TableCell>
+ <TableCell className="text-xs tabular-nums">{archiveDataTotal(archive).toLocaleString()}</TableCell>
+ <TableCell>
+ <div className="flex min-w-0 flex-col gap-1.5">
+ <ArchiveStateBadge state={archive.state} />
+ {processing && <Progress value={archive.progress} />}
+ {archive.error && (
+ <p className="text-destructive text-xs [overflow-wrap:anywhere]">{archive.error}</p>
+ )}
+ {[...new Set(archive.warnings ?? [])].map((warning) => (
+ <p
+ key={warning}
+ className="text-amber-700 text-xs [overflow-wrap:anywhere] dark:text-amber-400"
+ >
+ {warning}
+ </p>
+ ))}
+ <span className="text-muted-foreground text-xs">
+ {archive.phase} · {archive.progress}%
+ </span>
+ </div>
+ </TableCell>
+ <TableCell className="text-right">
+ <div className="flex justify-end gap-0.5">
+ {ARCHIVE_FAILED_STATES.has(archive.state) && (
+ <Button
+ size="icon"
+ variant="ghost"
+ onClick={() => void retry(archive)}
+ aria-label="재시도보관작업"
+ title="재시도"
+ >
+ <Undo2Icon />
+ </Button>
+ )}
+ {canRestore && (
+ <Button
+ size="icon"
+ variant="ghost"
+ onClick={() => void restoreMany([archive])}
+ aria-label="작업 복원"
+ title="작업 복원"
+ >
+ <Undo2Icon />
+ </Button>
+ )}
+ {canDelete && (
+ <ArchiveDeleteDialog
+ archives={[archive]}
+ onConfirm={() => deleteMany([archive])}
+ trigger={
+ <Button size="icon" variant="ghost" aria-label="영구 삭제보관" title="영구 삭제">
+ <Trash2Icon />
+ </Button>
+ }
+ />
+ )}
+ </div>
+ </TableCell>
+ </TableRow>
+ );
+ })}
+ </TableBody>
+ </Table>
+ )}
+ <TablePagination
+ page={page}
+ pageSize={pageSize}
+ total={total}
+ onPageChange={setPage}
+ onPageSizeChange={(size) => {
+ setPageSize(size);
+ setPage(1);
+ }}
+ />
+ </CardContent>
+ </Card>
+ );
+}
+
+const emptyDeleteOptions = (): DeleteTaskOptions => ({
+ delete_assets: false,
+ delete_traffic: false,
+ delete_files: false,
+ delete_findings: false,
+ delete_llm_records: false,
+});
+
+const deleteOptionKeys: (keyof DeleteTaskOptions)[] = [
+ "delete_assets",
+ "delete_traffic",
+ "delete_files",
+ "delete_findings",
+ "delete_llm_records",
+];
+
+// DeleteOptionFields renders the「연관 데이터 함께 정리」checkbox block shared by the
+// single-task and bulk delete dialogs. idPrefix keeps the label/input ids unique when
+// several dialogs live in the same table.
+function DeleteOptionFields({
+ idPrefix,
+ options,
+ onOptionsChange,
+ disabled,
+}: {
+ idPrefix: string;
+ options: DeleteTaskOptions;
+ onOptionsChange: React.Dispatch<React.SetStateAction<DeleteTaskOptions>>;
+ disabled: boolean;
+}) {
+ const selectedCount = deleteOptionKeys.filter((key) => options[key]).length;
+ let allChecked: boolean | "indeterminate" = false;
+ if (selectedCount === deleteOptionKeys.length) {
+ allChecked = true;
+ } else if (selectedCount > 0) {
+ allChecked = "indeterminate";
+ }
+
+ const updateOption = (key: keyof DeleteTaskOptions, checked: boolean) => {
+ onOptionsChange((current) => ({ ...current, [key]: checked }));
+ };
+
+ const updateAllOptions = (checked: boolean) => {
+ onOptionsChange({
+ delete_assets: checked,
+ delete_traffic: checked,
+ delete_files: checked,
+ delete_findings: checked,
+ delete_llm_records: checked,
+ });
+ };
+
+ return (
+ <FieldSet disabled={disabled}>
+ <FieldLegend variant="label">연관 데이터 함께 정리</FieldLegend>
+ <FieldGroup className="gap-3">
+ <Field orientation="horizontal">
+ <Checkbox
+ id={`delete-all-${idPrefix}`}
+ checked={allChecked}
+ onCheckedChange={(checked) => updateAllOptions(checked === true)}
+ />
+ <FieldContent>
+ <FieldLabel htmlFor={`delete-all-${idPrefix}`}>전체삭제</FieldLabel>
+ <FieldDescription>아래 연관 데이터 전체를 선택합니다. 자산, 트래픽, 파일, 취약점, LLM 요청/응답 기록이 포함됩니다.</FieldDescription>
+ </FieldContent>
+ </Field>
+ <Field orientation="horizontal">
+ <Checkbox
+ id={`delete-assets-${idPrefix}`}
+ checked={options.delete_assets}
+ onCheckedChange={(checked) => updateOption("delete_assets", checked === true)}
+ />
+ <FieldContent>
+ <FieldLabel htmlFor={`delete-assets-${idPrefix}`}>연관 자산</FieldLabel>
+ <FieldDescription>해당 작업에만 속한 자산을 삭제합니다. 공유 자산은 현재 작업 연결만 해제합니다.</FieldDescription>
+ </FieldContent>
+ </Field>
+ <Field orientation="horizontal">
+ <Checkbox
+ id={`delete-traffic-${idPrefix}`}
+ checked={options.delete_traffic}
+ onCheckedChange={(checked) => updateOption("delete_traffic", checked === true)}
+ />
+ <FieldContent>
+ <FieldLabel htmlFor={`delete-traffic-${idPrefix}`}>트래픽 연결</FieldLabel>
+ <FieldDescription>연관 자산의 정확한 호스트명으로 삭제합니다. 다른 작업이 참조하는 공유 호스트 트래픽은 유지됩니다.</FieldDescription>
+ </FieldContent>
+ </Field>
+ <Field orientation="horizontal">
+ <Checkbox
+ id={`delete-files-${idPrefix}`}
+ checked={options.delete_files}
+ onCheckedChange={(checked) => updateOption("delete_files", checked === true)}
+ />
+ <FieldContent>
+ <FieldLabel htmlFor={`delete-files-${idPrefix}`}>작업 파일</FieldLabel>
+ <FieldDescription>이 작업 작업 디렉터리의 파일 업로드, 명령 출력 및 기타 결과물을 삭제합니다.</FieldDescription>
+ </FieldContent>
+ </Field>
+ <Field orientation="horizontal">
+ <Checkbox
+ id={`delete-findings-${idPrefix}`}
+ checked={options.delete_findings}
+ onCheckedChange={(checked) => updateOption("delete_findings", checked === true)}
+ />
+ <FieldContent>
+ <FieldLabel htmlFor={`delete-findings-${idPrefix}`}>연관 취약점</FieldLabel>
+ <FieldDescription>이 작업에서 생성된 독립 취약점 기록과 취약점 보고서를 영구 삭제합니다.</FieldDescription>
+ </FieldContent>
+ </Field>
+ <Field orientation="horizontal">
+ <Checkbox
+ id={`delete-llm-records-${idPrefix}`}
+ checked={options.delete_llm_records}
+ onCheckedChange={(checked) => updateOption("delete_llm_records", checked === true)}
+ />
+ <FieldContent>
+ <FieldLabel htmlFor={`delete-llm-records-${idPrefix}`}>LLM 요청/응답 기록</FieldLabel>
+ <FieldDescription>이 작업에 기록된 LLM 요청, 응답, 토큰 및 오류 상세를 영구 삭제합니다.</FieldDescription>
+ </FieldContent>
+ </Field>
+ </FieldGroup>
+ </FieldSet>
+ );
+}
+
+function DeleteTaskDialog({
+ task,
+ onDelete,
+}: {
+ task: Task;
+ onDelete: (id: string, options: DeleteTaskOptions) => Promise<void>;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [deleting, setDeleting] = React.useState(false);
+ const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
+
+ const handleOpenChange = (next: boolean) => {
+ if (deleting) return;
+ setOpen(next);
+ if (next) setOptions(emptyDeleteOptions());
+ };
+
+ const handleDelete = async () => {
+ setDeleting(true);
+ try {
+ await onDelete(task.id, options);
+ setOpen(false);
+ } finally {
+ setDeleting(false);
+ }
+ };
+
+ return (
+ <AlertDialog open={open} onOpenChange={handleOpenChange}>
+ <AlertDialogTrigger asChild>
+ <Button size="icon" variant="outline" aria-label="삭제작업">
+ <Trash2Icon className="text-destructive" />
+ </Button>
+ </AlertDialogTrigger>
+ <AlertDialogContent>
+ <AlertDialogHeader>
+ <AlertDialogTitle>삭제 확인작업 #{task.id}？</AlertDialogTitle>
+ <AlertDialogDescription className="break-words">
+ {task.description ? (
+ <>
+ 「
+ <span className="break-all">
+ {task.description.length > 80 ? `${task.description.slice(0, 80)}…` : task.description}
+ </span>
+ 」
+ </>
+ ) : (
+ "해당 작업"
+ )}
+ 의 실행 기록과 탐색 링크가 영구 삭제됩니다.
+ </AlertDialogDescription>
+ </AlertDialogHeader>
+ <DeleteOptionFields idPrefix={task.id} options={options} onOptionsChange={setOptions} disabled={deleting} />
+ <AlertDialogFooter>
+ <AlertDialogCancel disabled={deleting}>취소</AlertDialogCancel>
+ <AlertDialogAction
+ variant="destructive"
+ disabled={deleting}
+ onClick={(event) => {
+ event.preventDefault();
+ void handleDelete();
+ }}
+ >
+ {deleting && <Spinner data-icon="inline-start" />}
+ {deleting ? "삭제 중" : "삭제"}
+ </AlertDialogAction>
+ </AlertDialogFooter>
+ </AlertDialogContent>
+ </AlertDialog>
+ );
+}
+
+// BulkDeleteTasksDialog deletes every checked task with one shared set of cleanup options.
+// The backend has no batch endpoint, so deletion runs one task at a time (see deleteTasks)
+// and the button shows live progress.
+// MoveTasksCategoryDialog confirms a target before applying, so a mis-click on a
+// large selection cannot silently re-file every task. UNCATEGORIZED_VALUE stands
+// in for "no category" because Select rejects an empty string value.
+function MoveTasksCategoryDialog({
+ categories,
+ count,
+ moving,
+ onMove,
+}: {
+ categories: TaskCategory[];
+ count: number;
+ moving: boolean;
+ onMove: (categoryID?: number) => Promise<void>;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [target, setTarget] = React.useState(UNCATEGORIZED_VALUE);
+
+ const handleOpenChange = (next: boolean) => {
+ if (moving) return;
+ setOpen(next);
+ if (next) setTarget(UNCATEGORIZED_VALUE);
+ };
+
+ return (
+ <Dialog open={open} onOpenChange={handleOpenChange}>
+ <DialogTrigger asChild>
+ <Button size="sm" variant="outline">
+ <FolderInputIcon data-icon="inline-start" /> 분류 변경
+ </Button>
+ </DialogTrigger>
+ <DialogContent>
+ <DialogHeader>
+ <DialogTitle>선택한 {count}개 작업의 분류 변경</DialogTitle>
+ <DialogDescription>목표 분류가 선택한 작업에 일괄 적용됩니다. 「미분류」를 선택하면 현재 분류에서 제거됩니다.</DialogDescription>
+ </DialogHeader>
+ <Field>
+ <FieldLabel htmlFor="bulk-category">목표분류</FieldLabel>
+ <Select value={target} onValueChange={setTarget} disabled={moving}>
+ <SelectTrigger id="bulk-category" className="w-full">
+ <SelectValue placeholder="선택분류" />
+ </SelectTrigger>
+ <SelectContent>
+ <SelectGroup>
+ <SelectItem value={UNCATEGORIZED_VALUE}>미분류</SelectItem>
+ {categories.map((category) => (
+ <SelectItem key={category.id} value={String(category.id)}>
+ {category.name}
+ </SelectItem>
+ ))}
+ </SelectGroup>
+ </SelectContent>
+ </Select>
+ {categories.length === 0 && <FieldDescription>분류가 없습니다. 「분류 관리」에서 먼저 만드세요.</FieldDescription>}
+ </Field>
+ <DialogFooter>
+ <DialogClose asChild>
+ <Button variant="outline" disabled={moving}>
+ 취소
+ </Button>
+ </DialogClose>
+ <Button
+ disabled={moving}
+ onClick={() => {
+ void onMove(target === UNCATEGORIZED_VALUE ? undefined : Number(target)).then(() => setOpen(false));
+ }}
+ >
+ {moving && <Spinner data-icon="inline-start" />}
+ 이동
+ </Button>
+ </DialogFooter>
+ </DialogContent>
+ </Dialog>
+ );
+}
+
+function BulkDeleteTasksDialog({
+ ids,
+ onDelete,
+}: {
+ ids: string[];
+ onDelete: (ids: string[], options: DeleteTaskOptions, onProgress: (done: number) => void) => Promise<void>;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [deleting, setDeleting] = React.useState(false);
+ const [done, setDone] = React.useState(0);
+ const [options, setOptions] = React.useState<DeleteTaskOptions>(emptyDeleteOptions);
+
+ const handleOpenChange = (next: boolean) => {
+ if (deleting) return;
+ setOpen(next);
+ if (next) {
+ setOptions(emptyDeleteOptions());
+ setDone(0);
+ }
+ };
+
+ const handleDelete = async () => {
+ setDeleting(true);
+ setDone(0);
+ try {
+ await onDelete(ids, options, setDone);
+ setOpen(false);
+ } finally {
+ setDeleting(false);
+ }
+ };
+
+ return (
+ <AlertDialog open={open} onOpenChange={handleOpenChange}>
+ <AlertDialogTrigger asChild>
+ <Button size="sm" variant="outline">
+ <Trash2Icon className="text-destructive" /> 삭제 {ids.length}
+ </Button>
+ </AlertDialogTrigger>
+ <AlertDialogContent className="max-h-[85vh] overflow-y-auto">
+ <AlertDialogHeader>
+ <AlertDialogTitle>선택한 {ids.length}개 작업을 삭제할까요?</AlertDialogTitle>
+ <AlertDialogDescription>
+ 선택한 작업의 실행 기록과 탐색 링크가 영구 삭제됩니다. 아래 정리 옵션은 선택한 작업에 일괄 적용됩니다.
+ </AlertDialogDescription>
+ </AlertDialogHeader>
+ <div className="text-muted-foreground flex flex-wrap gap-1 text-xs">
+ {ids.slice(0, 30).map((id) => (
+ <code key={id} className="bg-muted rounded px-1.5 py-0.5 font-mono">
+ #{id}
+ </code>
+ ))}
+ {ids.length > 30 && <span className="self-center">… 외 {ids.length} 개</span>}
+ </div>
+ <DeleteOptionFields idPrefix="bulk" options={options} onOptionsChange={setOptions} disabled={deleting} />
+ <AlertDialogFooter>
+ <AlertDialogCancel disabled={deleting}>취소</AlertDialogCancel>
+ <AlertDialogAction
+ variant="destructive"
+ disabled={deleting}
+ onClick={(event) => {
+ event.preventDefault();
+ void handleDelete();
+ }}
+ >
+ {deleting && <Spinner data-icon="inline-start" />}
+ {deleting ? `삭제 중 ${done}/${ids.length}` : `삭제 ${ids.length}개 작업`}
+ </AlertDialogAction>
+ </AlertDialogFooter>
+ </AlertDialogContent>
+ </AlertDialog>
+ );
+}
+
+// CreateTaskSheet is the 새 작업 drawer. Its form state lives HERE, not in TasksPage: with
+// 설명/목표 held by the page component every keystroke re-rendered the whole task table
+// behind the drawer (plus its sticky column and 20 AlertDialog trees), which showed up as
+// input lag. Now typing only re-renders the drawer.
+function SourceTaskPicker({
+ tasks,
+ value,
+ onValueChange,
+ portalContainer,
+}: {
+ tasks: Task[];
+ value: string[];
+ onValueChange: (value: string[]) => void;
+ portalContainer?: React.RefObject<HTMLElement | null>;
+}) {
+ const tasksByID = React.useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks]);
+ const taskIDs = React.useMemo(() => tasks.map((task) => task.id), [tasks]);
+ const atLimit = value.length >= MAX_SOURCE_TASKS;
+
+ const handleValueChange = (next: string[]) => {
+ onValueChange(next.slice(0, MAX_SOURCE_TASKS));
+ };
+
+ return (
+ <Combobox
+ items={taskIDs}
+ itemToStringValue={(taskID) => {
+ const task = tasksByID.get(taskID);
+ return task ? `${task.id} ${task.description} ${task.goal}` : taskID;
+ }}
+ multiple
+ value={value}
+ onValueChange={handleValueChange}
+ >
+ <ComboboxChips>
+ <ComboboxValue>
+ {value.map((taskID) => (
+ <ComboboxChip key={taskID}>#{taskID}</ComboboxChip>
+ ))}
+ </ComboboxValue>
+ <ComboboxChipsInput
+ id="source-tasks"
+ placeholder={atLimit ? `최대 ${MAX_SOURCE_TASKS}개 작업까지 연결` : "작업 ID, 설명 또는 목표 검색"}
+ disabled={atLimit}
+ />
+ </ComboboxChips>
+ <ComboboxContent portalContainer={portalContainer}>
+ <ComboboxEmpty>일치하는 작업 없음</ComboboxEmpty>
+ <ComboboxList>
+ {(taskID) => {
+ const task = tasksByID.get(taskID);
+ return (
+ <ComboboxItem key={taskID} value={taskID} disabled={atLimit && !value.includes(taskID)}>
+ <div className="flex min-w-0 flex-1 items-center gap-2">
+ <div className="min-w-0 flex-1">
+ <p className="truncate text-sm font-medium">
+ #{taskID} · {task?.description ?? "알 수 없는 작업"}
+ </p>
+ {task?.goal && <p className="text-muted-foreground truncate text-xs">{task.goal}</p>}
+ </div>
+ {task && <StatusBadge domain="task" value={task.status} />}
+ </div>
+ </ComboboxItem>
+ );
+ }}
+ </ComboboxList>
+ </ComboboxContent>
+ </Combobox>
+ );
+}
+
+// CategoryPicker 는새 작업단분류선택기：검색분류；입력없음이름후
+// （또는하「생성」）새 분류선택됨，선택됨건제거 tag 표시。분류는
+// 전역，여기생성·「분류 관리」새로 생성 외。허용개분류。
+function CategoryPicker({
+ categories,
+ value,
+ onValueChange,
+ onCategoryCreated,
+ portalContainer,
+}: {
+ categories: TaskCategory[];
+ value?: number;
+ onValueChange: (categoryID?: number) => void;
+ onCategoryCreated: () => void;
+ portalContainer?: React.RefObject<HTMLElement | null>;
+}) {
+ const [inputValue, setInputValue] = React.useState("");
+ const [creating, setCreating] = React.useState(false);
+ // 새로 생성분류 외신까지 categories，이，방지선택됨 chip
+ // 하에서창표시「알 수 없는 분류」。
+ const [localExtra, setLocalExtra] = React.useState<TaskCategory[]>([]);
+
+ const allCategories = React.useMemo(() => {
+ const byID = new Map<number, TaskCategory>();
+ for (const category of categories) byID.set(category.id, category);
+ for (const category of localExtra) if (!byID.has(category.id)) byID.set(category.id, category);
+ return [...byID.values()];
+ }, [categories, localExtra]);
+
+ const byID = React.useMemo(() => new Map(allCategories.map((c) => [String(c.id), c])), [allCategories]);
+ const categoryIDs = React.useMemo(() => allCategories.map((c) => String(c.id)), [allCategories]);
+ const selectedIDs = value != null ? [String(value)] : [];
+
+ const trimmed = inputValue.trim();
+ const lower = trimmed.toLowerCase();
+ // · base-ui 기본유지일치，「없음분류」。
+ const matchCount = trimmed
+ ? allCategories.filter((c) => c.name.toLowerCase().includes(lower)).length
+ : allCategories.length;
+
+ const createAndSelect = async () => {
+ if (!trimmed || creating) return;
+ // 정밀이름이미 존재직접선택됨，안 중복생성。
+ const existing = allCategories.find((c) => c.name.toLowerCase() === lower);
+ if (existing) {
+ onValueChange(existing.id);
+ setInputValue("");
+ return;
+ }
+ setCreating(true);
+ try {
+ const created = await api.createTaskCategory(trimmed);
+ setLocalExtra((prev) => [...prev, created]);
+ onValueChange(created.id);
+ setInputValue("");
+ onCategoryCreated();
+ toast.success(`생성됨분류「${created.name}」`);
+ } catch (e) {
+ toast.error(`분류 생성 실패: ${(e as Error).message}`);
+ } finally {
+ setCreating(false);
+ }
+ };
+
+ return (
+ <Combobox
+ items={categoryIDs}
+ itemToStringValue={(id) => byID.get(id)?.name ?? id}
+ multiple
+ value={selectedIDs}
+ onValueChange={(next: string[]) => {
+ // 단：신선택됨개；제거 chip（비우기）까지미분류。
+ const last = next[next.length - 1];
+ onValueChange(last ? Number(last) : undefined);
+ setInputValue("");
+ }}
+ inputValue={inputValue}
+ onInputValueChange={setInputValue}
+ >
+ <ComboboxChips>
+ <ComboboxValue>
+ {selectedIDs.map((id) => (
+ <ComboboxChip key={id}>{byID.get(id)?.name ?? "알 수 없는 분류"}</ComboboxChip>
+ ))}
+ </ComboboxValue>
+ <ComboboxChipsInput
+ id="task-category"
+ placeholder={selectedIDs.length ? "" : "분류 검색 또는 새 이름 입력 후 Enter로 생성"}
+ onKeyDown={(e) => {
+ // 전체없음일치 = 생성；일치건보존 base-ui 「선택됨높건」。
+ if (e.key === "Enter" && matchCount === 0 && trimmed) {
+ e.preventDefault();
+ void createAndSelect();
+ }
+ }}
+ />
+ </ComboboxChips>
+ <ComboboxContent portalContainer={portalContainer}>
+ <ComboboxList>
+ {(id: string) => (
+ <ComboboxItem key={id} value={id}>
+ {byID.get(id)?.name ?? id}
+ </ComboboxItem>
+ )}
+ </ComboboxList>
+ {matchCount === 0 &&
+ (trimmed ? (
+ <button
+ type="button"
+ disabled={creating}
+ onClick={() => void createAndSelect()}
+ className="flex w-full items-center gap-2 px-2 py-2 text-left text-sm hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+ >
+ {creating ? <Spinner className="size-4" /> : <PlusIcon className="size-4" />}
+ 분류 「{trimmed}」 생성
+ </button>
+ ) : (
+ <div className="px-2 py-2 text-sm text-muted-foreground">이름을 입력하여 분류를 검색하거나 생성하세요</div>
+ ))}
+ </ComboboxContent>
+ </Combobox>
+ );
+}
+
+const COMPANY_SCOPE_LABELS: Record<string, string> = {
+ domain: "도메인",
+ ip: "IP",
+ cidr: "CIDR",
+ icp: "ICP",
+ keyword: "키워드",
+};
+
+function companyScopeSummary(company: Company): string {
+ const rows = company.scope ?? [];
+ if (rows.length === 0) return "자산 범위 미구성";
+ const preview = rows.slice(0, 3).map((row) => {
+ const value = row.raw || row.value || row.domain || row.net || "";
+ return `${COMPANY_SCOPE_LABELS[row.kind] ?? row.kind}：${value}`;
+ });
+ return `${preview.join(" · ")}${rows.length > preview.length ? ` · 외 ${rows.length - preview.length}건` : ""}`;
+}
+
+function CompanyPicker({
+ companies,
+ value,
+ onValueChange,
+ portalContainer,
+}: {
+ companies: Company[];
+ value: number[];
+ onValueChange: (value: number[]) => void;
+ portalContainer?: React.RefObject<HTMLElement | null>;
+}) {
+ const companiesByID = React.useMemo(
+ () => new Map(companies.map((company) => [String(company.id), company])),
+ [companies],
+ );
+ const companyIDs = React.useMemo(() => companies.map((company) => String(company.id)), [companies]);
+ const selectedIDs = React.useMemo(() => value.map(String), [value]);
+
+ return (
+ <Combobox
+ items={companyIDs}
+ itemToStringValue={(companyID) => {
+ const company = companiesByID.get(companyID);
+ return company ? `${company.name} ${companyScopeSummary(company)}` : companyID;
+ }}
+ multiple
+ value={selectedIDs}
+ onValueChange={(next) => onValueChange(next.map(Number).filter(Number.isFinite))}
+ >
+ <ComboboxChips>
+ <ComboboxValue>
+ {selectedIDs.map((companyID) => (
+ <ComboboxChip key={companyID}>{companiesByID.get(companyID)?.name ?? `기업 #${companyID}`}</ComboboxChip>
+ ))}
+ </ComboboxValue>
+ <ComboboxChipsInput id="task-companies" placeholder="기업 이름 또는 자산 범위 검색" />
+ </ComboboxChips>
+ <ComboboxContent portalContainer={portalContainer}>
+ <ComboboxEmpty>일치하는 기업 없음</ComboboxEmpty>
+ <ComboboxList>
+ {(companyID) => {
+ const company = companiesByID.get(companyID);
+ return (
+ <ComboboxItem key={companyID} value={companyID}>
+ <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+ <div className="flex min-w-0 items-center gap-2">
+ <span className="min-w-0 flex-1 truncate font-medium">{company?.name ?? `기업 #${companyID}`}</span>
+ <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
+ {company?.asset_count ?? 0}개 자산
+ </span>
+ </div>
+ {company && (
+ <span className="text-muted-foreground truncate text-xs" title={companyScopeSummary(company)}>
+ {companyScopeSummary(company)}
+ </span>
+ )}
+ </div>
+ </ComboboxItem>
+ );
+ }}
+ </ComboboxList>
+ </ComboboxContent>
+ </Combobox>
+ );
+}
+
+type CategoryManagementView = number | "uncategorized" | "new";
+
+function CategoryDropTarget({
+ value,
+ name,
+ count,
+ selected,
+ disabled,
+ onSelect,
+}: {
+ value: string;
+ name: string;
+ count: number;
+ selected: boolean;
+ disabled: boolean;
+ onSelect: () => void;
+}) {
+ const { isOver, setNodeRef } = useDroppable({ id: `category:${value}`, disabled });
+
+ return (
+ <button
+ ref={setNodeRef}
+ type="button"
+ className={cn(
+ "min-w-0 rounded-md border border-transparent px-2.5 py-2 text-left transition-colors",
+ selected ? "bg-accent text-accent-foreground" : "hover:bg-accent/50",
+ isOver && "border-primary bg-primary/10 text-foreground",
+ )}
+ onClick={onSelect}
+ >
+ <span className="block truncate font-medium text-sm">{name}</span>
+ <span className="block truncate text-muted-foreground text-xs">{isOver ? "놓으면 이동" : `${count}개 작업`}</span>
+ </button>
+ );
+}
+
+function DraggableCategoryTask({ task, disabled, moving }: { task: Task; disabled: boolean; moving: boolean }) {
+ const { attributes, isDragging, listeners, setNodeRef } = useDraggable({
+ id: `task:${task.id}`,
+ disabled,
+ });
+
+ return (
+ <Item ref={setNodeRef} variant="outline" size="sm" className={cn(isDragging && "opacity-40")}>
+ <ItemMedia className="group-has-data-[slot=item-description]/item:self-center group-has-data-[slot=item-description]/item:translate-y-0">
+ {moving ? (
+ <Spinner />
+ ) : (
+ <Button
+ type="button"
+ size="icon-xs"
+ variant="ghost"
+ className="touch-none cursor-grab active:cursor-grabbing"
+ disabled={disabled}
+ {...listeners}
+ {...attributes}
+ aria-label={`작업 #${task.id} 드래그`}
+ title="작업 드래그"
+ >
+ <GripVerticalIcon />
+ </Button>
+ )}
+ </ItemMedia>
+ <ItemContent className="min-w-0">
+ <ItemTitle className="w-full min-w-0">
+ <Link href={`/function/tasks/detail?id=${encodeURIComponent(task.id)}`} className="truncate hover:underline">
+ {task.name?.trim() || task.description || `작업 #${task.id}`}
+ </Link>
+ </ItemTitle>
+ <ItemDescription className="line-clamp-1">
+ #{task.id} · {task.description}
+ </ItemDescription>
+ </ItemContent>
+ <ItemActions>
+ <StatusBadge domain="task" value={task.status} />
+ </ItemActions>
+ </Item>
+ );
+}
+
+function CategoryTaskDragPreview({ task }: { task: Task }) {
+ return (
+ <Item variant="outline" size="sm" className="w-80 bg-background shadow-lg">
+ <ItemMedia className="group-has-data-[slot=item-description]/item:self-center group-has-data-[slot=item-description]/item:translate-y-0">
+ <GripVerticalIcon className="size-4 text-muted-foreground" />
+ </ItemMedia>
+ <ItemContent className="min-w-0">
+ <ItemTitle className="w-full min-w-0 truncate">
+ {task.name?.trim() || task.description || `작업 #${task.id}`}
+ </ItemTitle>
+ <ItemDescription className="line-clamp-1">#{task.id}</ItemDescription>
+ </ItemContent>
+ </Item>
+ );
+}
+
+function CategoryManagementSheet({
+ categories,
+ tasks,
+ onChanged,
+ onTaskMoved,
+}: {
+ categories: TaskCategory[];
+ tasks: Task[];
+ onChanged: () => void;
+ onTaskMoved: (taskID: string, category: TaskCategory | null) => void;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [selectedView, setSelectedView] = React.useState<CategoryManagementView>("new");
+ const [draftName, setDraftName] = React.useState("");
+ const [saving, setSaving] = React.useState(false);
+ const [deleteOpen, setDeleteOpen] = React.useState(false);
+ const [deleting, setDeleting] = React.useState(false);
+ const [movingTaskID, setMovingTaskID] = React.useState<string | null>(null);
+ const [activeTaskID, setActiveTaskID] = React.useState<string | null>(null);
+ const wasOpen = React.useRef(false);
+ const sensors = useSensors(
+ useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+ useSensor(KeyboardSensor),
+ );
+
+ React.useEffect(() => {
+ if (open && !wasOpen.current) {
+ const first = categories[0];
+ if (first) {
+ setSelectedView(first.id);
+ setDraftName(first.name);
+ } else if (tasks.some((task) => task.category_id == null)) {
+ setSelectedView("uncategorized");
+ setDraftName("");
+ } else {
+ setSelectedView("new");
+ setDraftName("");
+ }
+ }
+ wasOpen.current = open;
+ }, [categories, open, tasks]);
+
+ const selectedCategory = React.useMemo(
+ () =>
+ typeof selectedView === "number" ? (categories.find((category) => category.id === selectedView) ?? null) : null,
+ [categories, selectedView],
+ );
+
+ const uncategorizedCount = React.useMemo(() => tasks.filter((task) => task.category_id == null).length, [tasks]);
+
+ const visibleTasks = React.useMemo(() => {
+ if (selectedView === "uncategorized") return tasks.filter((task) => task.category_id == null);
+ if (typeof selectedView === "number") return tasks.filter((task) => task.category_id === selectedView);
+ return [];
+ }, [selectedView, tasks]);
+
+ const activeTask = React.useMemo(() => tasks.find((task) => task.id === activeTaskID) ?? null, [activeTaskID, tasks]);
+
+ const selectCategory = (category: TaskCategory) => {
+ setSelectedView(category.id);
+ setDraftName(category.name);
+ };
+
+ const selectUncategorized = () => {
+ setSelectedView("uncategorized");
+ setDraftName("");
+ };
+
+ const startNew = () => {
+ setSelectedView("new");
+ setDraftName("");
+ };
+
+ async function saveCategory() {
+ const name = draftName.trim();
+ if (!name || saving || selectedView === "uncategorized") return;
+ setSaving(true);
+ try {
+ if (selectedView === "new") {
+ const created = await api.createTaskCategory(name);
+ setSelectedView(created.id);
+ setDraftName(created.name);
+ toast.success("분류생성됨");
+ } else {
+ const updated = await api.renameTaskCategory(selectedView, name);
+ setDraftName(updated.name);
+ toast.success("분류가 업데이트됨");
+ }
+ onChanged();
+ } catch (error) {
+ toast.error(`${selectedView === "new" ? "생성" : "업데이트"} 분류 실패: ${(error as Error).message}`);
+ } finally {
+ setSaving(false);
+ }
+ }
+
+ async function deleteCategory() {
+ if (!selectedCategory || deleting) return;
+ const deletedID = selectedCategory.id;
+ setDeleting(true);
+ try {
+ await api.deleteTaskCategory(deletedID);
+ const next = categories.find((category) => category.id !== deletedID);
+ if (next) selectCategory(next);
+ else selectUncategorized();
+ toast.success("분류가 삭제되었고, 연관 작업은 미분류로 이동했습니다");
+ setDeleteOpen(false);
+ onChanged();
+ } catch (error) {
+ toast.error(`삭제분류실패：${(error as Error).message}`);
+ } finally {
+ setDeleting(false);
+ }
+ }
+
+ async function moveTask(task: Task, destination: string) {
+ if (movingTaskID) return;
+ const category =
+ destination === "uncategorized" ? null : (categories.find((item) => item.id === Number(destination)) ?? null);
+ if (destination !== "uncategorized" && !category) {
+ toast.error("목표 분류가 없습니다. 새로 고친 후 다시 시도하세요");
+ return;
+ }
+ if (task.category_id === category?.id || (task.category_id == null && category == null)) return;
+
+ setMovingTaskID(task.id);
+ try {
+ await api.updateTaskCategory(task.id, category?.id);
+ onTaskMoved(task.id, category);
+ toast.success(`작업 #${task.id}이(가) 「${category?.name ?? "미분류"}」으로 이동됨`);
+ } catch (error) {
+ toast.error(`이동작업실패：${(error as Error).message}`);
+ } finally {
+ setMovingTaskID(null);
+ }
+ }
+
+ function handleDragStart(event: DragStartEvent) {
+ const id = String(event.active.id);
+ setActiveTaskID(id.startsWith("task:") ? id.slice("task:".length) : null);
+ }
+
+ function handleDragEnd(event: DragEndEvent) {
+ const activeID = String(event.active.id);
+ const taskID = activeID.startsWith("task:") ? activeID.slice("task:".length) : null;
+ setActiveTaskID(null);
+ if (!taskID || !event.over) return;
+ const destination = String(event.over.id);
+ if (!destination.startsWith("category:")) return;
+ const task = tasks.find((item) => item.id === taskID);
+ if (!task) return;
+ void moveTask(task, destination.slice("category:".length));
+ }
+
+ const saveLabel = saving ? "저장 중" : selectedView === "new" ? "분류 생성" : "변경 사항 저장";
+
+ return (
+ <>
+ <Sheet open={open} onOpenChange={setOpen}>
+ <SheetTrigger asChild>
+ <Button size="sm" variant="outline">
+ <TagsIcon data-icon="inline-start" />
+ 분류 관리
+ </Button>
+ </SheetTrigger>
+ <SheetContent className="grid h-full w-full! max-w-none! grid-rows-[auto_minmax(0,1fr)_auto] gap-0 overflow-hidden p-0 sm:w-[48rem]! sm:max-w-[48rem]!">
+ <SheetHeader className="border-b px-6 py-5">
+ <SheetTitle>작업 분류 관리</SheetTitle>
+ <SheetDescription>분류는 작업 필터와 보관에 사용됩니다. 변경해도 작업 실행에는 영향 없고, 삭제하면 작업은 미분류로 이동합니다.</SheetDescription>
+ </SheetHeader>
+ <DndContext
+ sensors={sensors}
+ onDragStart={handleDragStart}
+ onDragCancel={() => setActiveTaskID(null)}
+ onDragEnd={handleDragEnd}
+ >
+ <div className="grid min-h-0 overflow-y-auto lg:grid-cols-[15rem_minmax(0,1fr)] lg:overflow-hidden">
+ <div className="flex min-h-0 flex-col border-b p-3 lg:border-r lg:border-b-0">
+ <Button type="button" variant="outline" className="w-full" onClick={startNew}>
+ <PlusIcon data-icon="inline-start" />
+ 새 분류
+ </Button>
+ <ScrollArea className="mt-2 max-h-44 lg:max-h-none lg:flex-1">
+ <div className="flex flex-col gap-1 pr-2">
+ <CategoryDropTarget
+ value="uncategorized"
+ name="미분류"
+ count={uncategorizedCount}
+ selected={selectedView === "uncategorized"}
+ disabled={movingTaskID != null}
+ onSelect={selectUncategorized}
+ />
+ {categories.map((category) => (
+ <CategoryDropTarget
+ key={category.id}
+ value={String(category.id)}
+ name={category.name}
+ count={category.task_count}
+ selected={selectedView === category.id}
+ disabled={movingTaskID != null}
+ onSelect={() => selectCategory(category)}
+ />
+ ))}
+ </div>
+ </ScrollArea>
+ </div>
+ <ScrollArea className="min-h-0">
+ <FieldGroup className="p-6">
+ {selectedView !== "uncategorized" && (
+ <Field>
+ <FieldLabel htmlFor="task-category-name">분류이름</FieldLabel>
+ <Input
+ id="task-category-name"
+ value={draftName}
+ onChange={(event) => setDraftName(event.target.value)}
+ placeholder="예: 외부망 평가"
+ maxLength={80}
+ onKeyDown={(event) => {
+ if (event.key === "Enter") void saveCategory();
+ }}
+ />
+ <FieldDescription>
+ {selectedCategory
+ ? `현재 이 분류를 사용하는 작업이 ${selectedCategory.task_count}개입니다. 이름을 바꾸면 작업 목록에도 반영됩니다.`
+ : "생성 후 새 작업과 작업 목록 필터에서 사용할 수 있습니다."}
+ </FieldDescription>
+ </Field>
+ )}
+ {selectedView !== "new" && (
+ <Field>
+ <div className="flex flex-wrap items-end justify-between gap-2">
+ <div className="flex min-w-0 flex-col gap-1">
+ <FieldLabel>{selectedCategory ? "분류작업" : "미분류작업"}</FieldLabel>
+ <FieldDescription>
+ {selectedCategory
+ ? `이 분류에 작업 ${visibleTasks.length}개가 있습니다.`
+ : `현재 미분류 작업이 ${visibleTasks.length}개 있습니다.`}
+ </FieldDescription>
+ </div>
+ </div>
+ {visibleTasks.length === 0 ? (
+ <Empty className="min-h-36 border">
+ <EmptyHeader>
+ <EmptyTitle>{selectedCategory ? "이 분류에 작업 없음" : "미분류 작업 없음"}</EmptyTitle>
+ <EmptyDescription>작업이 이 분류에 들어오면 여기에 표시됩니다.</EmptyDescription>
+ </EmptyHeader>
+ </Empty>
+ ) : (
+ <ItemGroup className="gap-2">
+ {visibleTasks.map((task) => (
+ <DraggableCategoryTask
+ key={task.id}
+ task={task}
+ moving={movingTaskID === task.id}
+ disabled={movingTaskID != null}
+ />
+ ))}
+ </ItemGroup>
+ )}
+ </Field>
+ )}
+ </FieldGroup>
+ </ScrollArea>
+ </div>
+ <DragOverlay>{activeTask ? <CategoryTaskDragPreview task={activeTask} /> : null}</DragOverlay>
+ </DndContext>
+ <SheetFooter className="border-t px-6 py-4 sm:flex-row sm:items-center">
+ {selectedCategory && (
+ <Button
+ type="button"
+ variant="destructive"
+ className="sm:mr-auto"
+ disabled={saving || deleting}
+ onClick={() => setDeleteOpen(true)}
+ >
+ <Trash2Icon data-icon="inline-start" />
+ 삭제분류
+ </Button>
+ )}
+ <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+ 꺼짐
+ </Button>
+ {selectedView !== "uncategorized" && (
+ <Button
+ type="button"
+ disabled={!draftName.trim() || saving || deleting}
+ onClick={() => void saveCategory()}
+ >
+ {saving ? <Spinner data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
+ {saveLabel}
+ </Button>
+ )}
+ </SheetFooter>
+ </SheetContent>
+ </Sheet>
+ <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+ <AlertDialogContent>
+ <AlertDialogHeader>
+ <AlertDialogTitle>삭제분류「{selectedCategory?.name || "이름 없음분류"}」？</AlertDialogTitle>
+ <AlertDialogDescription>
+ 분류를 삭제하면 {selectedCategory?.task_count ?? 0}개 작업이 자동으로 「미분류」로 이동합니다. 작업 데이터는 삭제되지 않습니다.
+ </AlertDialogDescription>
+ </AlertDialogHeader>
+ <AlertDialogFooter>
+ <AlertDialogCancel disabled={deleting}>취소</AlertDialogCancel>
+ <AlertDialogAction
+ variant="destructive"
+ disabled={deleting}
+ onClick={(event) => {
+ event.preventDefault();
+ void deleteCategory();
+ }}
+ >
+ {deleting && <Spinner data-icon="inline-start" />}
+ {deleting ? "삭제 중" : "삭제"}
+ </AlertDialogAction>
+ </AlertDialogFooter>
+ </AlertDialogContent>
+ </AlertDialog>
+ </>
+ );
+}
+
+function CreateTaskSheet({
+ tasks,
+ categories,
+ onCreated,
+ onCategoriesChanged,
+}: {
+ tasks: Task[];
+ categories: TaskCategory[];
+ onCreated: () => void;
+ onCategoriesChanged: () => void;
+}) {
+ const [open, setOpen] = React.useState(false);
+ const [name, setName] = React.useState("");
+ const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
+ const [description, setDescription] = React.useState("");
+ const [goal, setGoal] = React.useState("");
+ const [selectedTemplateID, setSelectedTemplateID] = React.useState<number | null>(null);
+ const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
+ const [companies, setCompanies] = React.useState<Company[]>([]);
+ const [sourceTaskIDs, setSourceTaskIDs] = React.useState<string[]>([]);
+ const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
+ const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
+ const [creating, setCreating] = React.useState(false);
+ const [timeoutMin, setTimeoutMin] = React.useState(""); // 작업급타임아웃(분);/0 = 제한 없음
+ const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner (분);기본10,하10(백엔드와일치)
+ const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // 생성하종의도,worker 외 planner 직접;기본꺼짐,실행
+ const [coverageEnabled, setCoverageEnabled] = React.useState(true); // 자산 커버리지 기능;기본。꺼짐=안 /표시커버리지、안 범위、범위유형도구(company 연관안 영향)
+ const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // 작업급 자산차단규칙(이작업적용,안 전역)
+ // 1 파일업로드:작업전파일까지 drafts/<draftId>/uploads/,절대 경로추가설명。
+ const [uploading, setUploading] = React.useState(false);
+ const [uploadCount, setUploadCount] = React.useState(0);
+ const draftIdRef = React.useRef<string>("");
+ const fileInputRef = React.useRef<HTMLInputElement>(null);
+ const sheetContentRef = React.useRef<HTMLDivElement>(null);
+
+ // load LLM profiles once for the create-task profile picker.
+ React.useEffect(() => {
+ api
+ .llmProfiles()
+ .then(setProfiles)
+ .catch(() => setProfiles([]));
+ api
+ .companies()
+ .then(setCompanies)
+ .catch(() => setCompanies([]));
+ }, []);
+
+ // pickFiles uploads the chosen files into this draft's staging dir and appends their
+ // absolute paths to the description; the task's agents open them by path via Read/Bash.
+ async function pickFiles(files: FileList | null) {
+ if (!files || files.length === 0) return;
+ // crypto.randomUUID 에서전체컨텍스트(https/localhost); IP+http 급。
+ if (!draftIdRef.current) {
+ draftIdRef.current =
+ globalThis.crypto?.randomUUID?.() ?? `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+ }
+ setUploading(true);
+ try {
+ const r = await api.chatUpload("staging", draftIdRef.current, Array.from(files));
+ setDescription((prev) => appendUploads(prev, r.attachments));
+ setUploadCount((n) => n + r.attachments.length);
+ } catch (e) {
+ toast.error("업로드 실패: " + (e as Error).message);
+ } finally {
+ setUploading(false);
+ if (fileInputRef.current) fileInputRef.current.value = ""; // allow re-picking the same file
+ }
+ }
+
+ async function createTask() {
+ if (!description.trim() || !goal.trim()) {
+ toast.error("설명과 목표를 입력하세요");
+ return;
+ }
+ if (sourceTaskIDs.length > MAX_SOURCE_TASKS) {
+ toast.error(`출처 작업은 최대 ${MAX_SOURCE_TASKS}개까지 연결`);
+ return;
+ }
+ setCreating(true);
+ try {
+ const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
+ const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // 하 10min，백엔드와일치
+ await api.createTask({
+ name: name.trim(),
+ categoryId: categoryID,
+ description: description.trim(),
+ goal: goal.trim(),
+ llmProfileIds: llmProfileIDs.map(Number),
+ sourceTaskIds: sourceTaskIDs,
+ companyIds: companyIDs,
+ timeoutSeconds: timeoutSec,
+ seedFirstIntent,
+ planHeartbeatSeconds: heartbeatSec,
+ coverageEnabled,
+ interceptRules: interceptRules
+ .map((r) => ({ ...r, pattern: r.pattern.trim() }))
+ .filter((r) => r.pattern !== ""),
+ });
+ toast.success("작업생성됨");
+ setName("");
+ setCategoryID(undefined);
+ setDescription("");
+ setGoal("");
+ setSelectedTemplateID(null);
+ setSourceTaskIDs([]);
+ setCompanyIDs([]);
+ setLLMProfileIDs([]);
+ setTimeoutMin("");
+ setHeartbeatMin("10");
+ setSeedFirstIntent(false);
+ setCoverageEnabled(true);
+ setInterceptRules([]);
+ setUploadCount(0);
+ draftIdRef.current = "";
+ setOpen(false);
+ onCreated();
+ } catch (e) {
+ toast.error("생성 실패: " + (e as Error).message);
+ } finally {
+ setCreating(false);
+ }
+ }
+
+ return (
+ <Sheet open={open} onOpenChange={setOpen}>
+ <SheetTrigger asChild>
+ <Button size="sm">
+ <PlusIcon /> 새 작업
+ </Button>
+ </SheetTrigger>
+ {/* 45vw 우드로어:높도,단더 이상높도제한。를전체。
+ 내를 flex 열:/고정,중필드 flex-1 독립。 */}
+ <SheetContent
+ ref={sheetContentRef}
+ side="right"
+ className="w-full! max-w-none! gap-0 p-0 sm:w-[45vw]! sm:max-w-[45vw]!"
+ >
+ <SheetHeader className="border-b p-6">
+ <SheetTitle>새 작업</SheetTitle>
+ <SheetDescription>테스트 대상과 목표를 입력하고, 고급 매개변수는 필요 시 펼치세요.</SheetDescription>
+ </SheetHeader>
+
+ <div className="flex-1 overflow-y-auto p-6">
+ <div className="grid gap-5">
+ <TaskTemplateControls
+ description={description}
+ goal={goal}
+ categoryID={categoryID}
+ interceptRules={interceptRules}
+ selectedTemplateID={selectedTemplateID}
+ onSelectedTemplateIDChange={setSelectedTemplateID}
+ onApply={(template) => {
+ setDescription(template.description);
+ setGoal(template.goal);
+ setCategoryID(template.category_id ?? undefined);
+ setInterceptRules(template.intercept_rules ?? []);
+ setUploadCount(0);
+ }}
+ portalContainer={sheetContentRef}
+ />
+ <div className="grid gap-2">
+ <Label htmlFor="name">이름(선택)</Label>
+ <Input
+ id="name"
+ placeholder="작업을 구분하기 쉬운 이름, 예: Acme 공식 사이트 테스트"
+ value={name}
+ onChange={(e) => setName(e.target.value)}
+ />
+ </div>
+ <Field>
+ <FieldLabel htmlFor="task-category">작업 분류</FieldLabel>
+ <CategoryPicker
+ categories={categories}
+ value={categoryID}
+ onValueChange={setCategoryID}
+ onCategoryCreated={onCategoriesChanged}
+ portalContainer={sheetContentRef}
+ />
+ <FieldDescription>선택 사항, 단일 분류. 작업 목록 필터와 보관에 사용되며 Agent 실행에는 영향 없습니다.</FieldDescription>
+ </Field>
+ <div className="grid gap-2">
+ <Label htmlFor="description">설명</Label>
+ <Textarea
+ id="description"
+ className="min-h-32"
+ placeholder="테스트 대상과 배경, 예: example.com 사이트 테스트"
+ value={description}
+ onChange={(e) => setDescription(e.target.value)}
+ />
+ {/* 파일 업로드(다중 선택):까지 drafts/,절대 경로추가상설명,worker 이 Read/Bash 열기。 */}
+ <div className="flex flex-wrap items-center gap-2">
+ <input
+ ref={fileInputRef}
+ type="file"
+ multiple
+ className="hidden"
+ onChange={(e) => void pickFiles(e.target.files)}
+ />
+ <Button
+ type="button"
+ variant="outline"
+ size="sm"
+ onClick={() => fileInputRef.current?.click()}
+ disabled={uploading}
+ >
+ {uploading ? <Loader2Icon className="animate-spin" /> : <PaperclipIcon />}
+ 파일 업로드
+ </Button>
+ <span className="text-muted-foreground text-xs">
+ {uploadCount > 0
+ ? `파일 ${uploadCount}개 업로드됨, 절대 경로가 설명 끝에 추가됨(편집 가능)`
+ : "여러 개 선택 가능. 업로드 후 파일 절대 경로를 설명에 추가해 worker가 Read/Bash로 엽니다"}
+ </span>
+ </div>
+ </div>
+ <div className="grid gap-2">
+ <Label htmlFor="goal">목표</Label>
+ <Textarea
+ id="goal"
+ className="min-h-32"
+ placeholder="달성 목표, 예: 관리자 권한 확보, 서버 권한 확보"
+ value={goal}
+ onChange={(e) => setGoal(e.target.value)}
+ />
+ </div>
+ <Field>
+ <FieldLabel htmlFor="source-tasks">연관 작업</FieldLabel>
+ <SourceTaskPicker
+ tasks={tasks}
+ value={sourceTaskIDs}
+ onValueChange={setSourceTaskIDs}
+ portalContainer={sheetContentRef}
+ />
+ <FieldDescription>
+ 최대 {MAX_SOURCE_TASKS}개 작업까지 연결할 수 있습니다. 선택한 작업의 영속 블랙보드, 자산 범위 및 관련 트래픽을 실시간 읽기 전용으로 상속합니다. 새 작업은 독립 블랙보드에 기록합니다.
+ </FieldDescription>
+ </Field>
+ <Field>
+ <FieldLabel htmlFor="task-companies">연관 기업 자산 범위</FieldLabel>
+ <CompanyPicker
+ companies={companies}
+ value={companyIDs}
+ onValueChange={setCompanyIDs}
+ portalContainer={sheetContentRef}
+ />
+ <FieldDescription>
+ 작업 생성 시 선택한 기업의 기존 자산을 「테스트 자산」에 넣고, 도메인·IP·CIDR·ICP·기업 키워드를 Agent에
+ 범위 컨텍스트로 제공합니다. 의도를 자동 생성하거나 실행 목표를 강제로 바꾸지 않습니다.
+ </FieldDescription>
+ </Field>
+ <Field>
+ <FieldLabel htmlFor="task-intercept-rules">작업 수준 자산 차단/허용 규칙(선택)</FieldLabel>
+ <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
+ <FieldDescription>
+ 이 작업에만 적용되며 전역 규칙에는 기록하지 않습니다. 「차단」 규칙(전역 포함)을 먼저 매칭하고, 맞으면 테스트 금지. 「허용」 규칙이 있으면 허용 규칙에 맞아야 테스트 가능합니다. 허용 규칙이 없으면 화이트리스트는 사용하지 않습니다.
+ </FieldDescription>
+ </Field>
+ <Field>
+ <FieldLabel htmlFor="llm-profiles">LLM 구성 체인</FieldLabel>
+ <TaskLLMProfileChain
+ profiles={profiles}
+ value={llmProfileIDs}
+ onValueChange={setLLMProfileIDs}
+ inputId="llm-profiles"
+ portalContainer={sheetContentRef}
+ />
+ <FieldDescription>목록 순서로 장애 조치합니다. 첫 항목이 현재 구성이며, 한도 부족이 명확할 때만 다음으로 전환합니다.</FieldDescription>
+ </Field>
+
+ {/* 높급매개변수기본접기:타임아웃//개의도,펼치기,경로유지。 */}
+ <Collapsible>
+ <CollapsibleTrigger className="group flex w-full items-center gap-2 border-t pt-4 text-sm font-medium">
+ <ChevronRightIcon className="text-muted-foreground size-4 transition-transform group-data-[state=open]:rotate-90" />
+ 고급 설정
+ <span className="text-muted-foreground ml-auto text-xs font-normal">타임아웃 · 하트비트 · 첫 의도</span>
+ </CollapsibleTrigger>
+ <CollapsibleContent className="grid gap-5 pt-5">
+ <div className="grid gap-2">
+ <Label htmlFor="timeout-min">작업 타임아웃(분, 선택)</Label>
+ <Input
+ id="timeout-min"
+ type="number"
+ min={0}
+ className="w-40"
+ placeholder="비우면 제한 없음"
+ value={timeoutMin}
+ onChange={(e) => setTimeoutMin(e.target.value)}
+ />
+ <p className="text-muted-foreground text-xs">
+ 시간이 되면 정리 단계를 실행합니다(각 agent 기록 + planner 최종 판정). 작업은 timeout 종료 상태가 됩니다.
+ </p>
+ </div>
+ <div className="grid gap-2">
+ <Label htmlFor="heartbeat-min">planner 하트비트(분)</Label>
+ <Input
+ id="heartbeat-min"
+ type="number"
+ min={10}
+ className="w-40"
+ placeholder="기본 10"
+ value={heartbeatMin}
+ onChange={(e) => setHeartbeatMin(e.target.value)}
+ />
+ <p className="text-muted-foreground text-xs">
+ 이전 계획 종료/작업 시작 후 이 시간이 지나고 트리거가 없으면 자동으로 한 번 계획합니다(멈춤 방지 + 실행 중 worker 감독)
+ worker). 하한 10분.
+ </p>
+ </div>
+ <div className="grid gap-2">
+ <label htmlFor="seed-first-intent" className="flex items-center gap-2 text-sm">
+ <Checkbox
+ id="seed-first-intent"
+ checked={seedFirstIntent}
+ onCheckedChange={(v) => setSeedFirstIntent(!!v)}
+ />
+ 첫 의도를 바로 배포(설명+목표)
+ </label>
+ <p className="text-muted-foreground text-xs">
+ 켜면 생성 시 「설명+목표」를 하나의 의도로 배포해 worker가 첫 계획 없이 바로 실행하고, 완료 후 planner가
+ 판정/보완합니다. CTF 등 단일 작업으로 해결하는 경우에 권장합니다. 끄면 먼저 계획 후 실행합니다.
+ </p>
+ </div>
+ <div className="grid gap-2">
+ <label htmlFor="coverage-enabled" className="flex items-center gap-2 text-sm">
+ <Checkbox
+ id="coverage-enabled"
+ checked={coverageEnabled}
+ onCheckedChange={(v) => setCoverageEnabled(!!v)}
+ />
+ 자산 커버리지 기능
+ </label>
+ <p className="text-muted-foreground text-xs">
+ 기본 켜짐: 테스트 커버리지를 계산·표시하고, 상황도에 진행을 표시하며 테스트 범위를 자동 누적합니다. 끄면 커버리지를 계산/표시하지 않으며,
+ 상황도는 자산만 표시하고 진행은 숨깁니다. agent는 범위 도구를 받지 않습니다. 끄기는 「연관 기업 자산 범위」에 영향 없습니다.
+ </p>
+ </div>
+ </CollapsibleContent>
+ </Collapsible>
+ </div>
+ </div>
+
+ <SheetFooter className="flex-row justify-end gap-2 border-t p-4">
+ <SheetClose asChild>
+ <Button variant="outline">취소</Button>
+ </SheetClose>
+ <Button onClick={createTask} disabled={creating || uploading}>
+ {creating && <Spinner data-icon="inline-start" />}
+ {creating ? "생성 중" : "생성"}
+ </Button>
+ </SheetFooter>
+ </SheetContent>
+ </Sheet>
+ );
+}

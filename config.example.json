@@ -1,0 +1,20 @@
+{
+  "_comment": "config.json 으로 복사(또는 환경 변수 ARTEX_CONFIG). database 와 skill_dir 만 포함; LLM 등은 환경 변수 또는 앱 설정에서.",
+  "_comment_database": "PostgreSQL. 우선순위: ARTEX_PG_DSN > database. (A) 아래 필드 또는 (B) database.dsn 전체 연결 문자열.",
+  "database": {
+    "host": "127.0.0.1",
+    "port": 5433,
+    "user": "artex",
+    "password": "",
+    "dbname": "artex",
+    "sslmode": "disable"
+  },
+  "_comment_database_dsn": "(B) 위 database 를 지우고 dsn 만 사용. dsn 이 있으면 분할 필드는 무시됩니다.",
+  "_example_database_dsn": {
+    "database": {
+      "dsn": "postgres://user:pass@db.example.com:5432/artex?sslmode=require"
+    }
+  },
+  "_comment_skill_dir": "skill 루트(하위 디렉터리마다 SKILL.md). 우선순위: ARTEX_SKILL_DIR > 이 필드 > 기본(실행 파일 옆 skills/). 상대 경로는 현재 작업 디렉터리 기준.",
+  "skill_dir": "/opt/artex/skills"
+}
